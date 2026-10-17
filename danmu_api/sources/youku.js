@@ -12,6 +12,26 @@ import { SegmentListResponse } from '../models/dandan-model.js';
 // 获取优酷弹幕
 // =====================
 
+const SERVERLESS_PLATFORMS = new Set(['cloudflare', 'vercel', 'netlify', 'edgeone', 'huggingface']);
+const SERVERLESS_YOUKU_TIMEOUT_MS = 4000;
+
+function isServerlessRuntime() {
+  return SERVERLESS_PLATFORMS.has(String(globals.deployPlatform || '').toLowerCase());
+}
+
+function youkuRequestOptions(options = {}) {
+  if (!isServerlessRuntime()) return options;
+
+  const configuredTimeout = Number(options.timeout || globals.vodRequestTimeout || 5000) || 5000;
+  return {
+    ...options,
+    // 单个上游请求不能吃掉 Infuse 的整个 10 秒等待窗口。
+    timeout: Math.min(configuredTimeout, SERVERLESS_YOUKU_TIMEOUT_MS),
+    // 边缘首请求失败后重试会把总耗时直接推过客户端超时。
+    retries: 0,
+  };
+}
+
 /**
  * 生成本地兜底 cna。
  * 优酷弹幕接口只把 cna 当作请求体里的客户端标识（guid）回传，不校验其来源，
@@ -458,7 +478,7 @@ export default class YoukuSource extends BaseSource {
 
     for (let i = 0; i < segments.length; i += concurrency) {
       const batch = segments.slice(i, i + concurrency).map(async (segment) => {
-        const response = await httpPost(segment.url, buildQueryString({ data: segment.data }), {
+        const response = await httpPost(segment.url, buildQueryString({ data: segment.data }), youkuRequestOptions({
           headers: {
             "Cookie": `_m_h5_tk=${segment._m_h5_tk};_m_h5_tk_enc=${segment._m_h5_tk_enc};`,
             "Referer": "https://v.youku.com",
@@ -467,7 +487,7 @@ export default class YoukuSource extends BaseSource {
           },
           allow_redirects: false,
           retries: 1,
-        });
+        }));
 
         const results = [];
         if (response.data?.data && response.data.data.result) {
@@ -539,13 +559,13 @@ export default class YoukuSource extends BaseSource {
     let res;
     try {
       const videoInfoUrl = `${api_video_info}?client_id=53e6cc67237fc59a&video_id=${video_id}&package=com.huawei.hwvplayer.youku&ext=show`;
-      res = await httpGet(videoInfoUrl, {
+      res = await httpGet(videoInfoUrl, youkuRequestOptions({
         headers: {
           "Content-Type": "application/json",
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
         },
         allow_redirects: false
-      });
+      }));
     } catch (error) {
       log("error", "[youku] 请求视频信息失败:", error);
       return this._emptySegmentList();
@@ -574,18 +594,24 @@ export default class YoukuSource extends BaseSource {
     // 首次失败后改用本地生成的等价格式 cna 兜底，之后不再请求该域名
     let cna = null;
     let _m_h5_tk_enc = null, _m_h5_tk = null;
-    if (this._useFallbackCna) {
+    // Cloudflare/其他边缘环境中 mmstat 常因冷启动或网络策略额外耗时；
+    // cna 只是客户端标识，直接使用本地兜底值即可，不应阻塞弹幕正文。
+    if (this._useFallbackCna || isServerlessRuntime()) {
       cna = this._getFallbackCna();
+      if (isServerlessRuntime() && !this._useFallbackCna) {
+        log("info", "[youku] 边缘运行时跳过 mmstat，使用本地生成 cna");
+        this._useFallbackCna = true;
+      }
     } else {
       try {
         const cnaUrl = "https://log.mmstat.com/eg.js";
-        const cnaRes = await httpGet(cnaUrl, {
+        const cnaRes = await httpGet(cnaUrl, youkuRequestOptions({
           headers: {
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
           },
           allow_redirects: false
-        });
+        }));
         const etag = cnaRes?.headers?.["etag"] || cnaRes?.headers?.["Etag"];
         if (typeof etag === "string" && etag.trim()) {
           cna = etag.replace(/^"|"$/g, '');
@@ -603,16 +629,13 @@ export default class YoukuSource extends BaseSource {
     // 获取 tk_enc / _m_h5_tk（mtop 签名 token 由服务端下发，无法本地生成）
     try {
       const tkEncUrl = "https://acs.youku.com/h5/mtop.com.youku.aplatform.weakget/1.0/?jsv=2.5.1&appKey=24679788";
-      let tkEncRes;
-      while (!tkEncRes) {
-        tkEncRes = await httpGet(tkEncUrl, {
+      const tkEncRes = await httpGet(tkEncUrl, youkuRequestOptions({
           headers: {
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
           },
           allow_redirects: false
-        });
-      }
+        }));
       const tkEncSetCookie = tkEncRes?.headers?.["set-cookie"] || tkEncRes?.headers?.["Set-Cookie"] || "";
 
       // 获取 _m_h5_tk_enc
@@ -741,7 +764,7 @@ export default class YoukuSource extends BaseSource {
   async getEpisodeSegmentDanmu(segment) {
     log("info", "[youku] 开始从本地请求优酷分段弹幕...", segment.url);
 
-    const response = await httpPost(segment.url, buildQueryString({ data: segment.data }), {
+    const response = await httpPost(segment.url, buildQueryString({ data: segment.data }), youkuRequestOptions({
       headers: {
         "Cookie": `_m_h5_tk=${segment._m_h5_tk};_m_h5_tk_enc=${segment._m_h5_tk_enc};`,
         "Referer": "https://v.youku.com",
@@ -750,7 +773,7 @@ export default class YoukuSource extends BaseSource {
       },
       allow_redirects: false,
       retries: 1,
-    });
+    }));
 
     const results = [];
     if (response.data?.data && response.data.data.result) {

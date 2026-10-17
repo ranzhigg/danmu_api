@@ -35,6 +35,7 @@ test('searchEpisodes should accept Infuse-style tmdbId-only requests', async () 
   const requestUrl = new URL(`${urlPrefix}/api/v2/search/episodes?tmdbId=300146&tmdbIdType=0&episode=1`);
   const fakeSearchAnime = async (searchUrl, _preferAnimeId, _preferSource, detailStore) => {
     assert.equal(searchUrl.searchParams.get('keyword'), '嫁金钗');
+    assert.equal(searchUrl.searchParams.get('episodeLookup'), '1');
 
     detailStore.set('detail', {
       animeId: 7001,

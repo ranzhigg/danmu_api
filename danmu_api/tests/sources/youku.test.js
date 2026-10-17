@@ -67,6 +67,22 @@ test('youku source falls back to a locally generated cna', async (t) => {
     return { fetchImpl, calls };
   };
 
+  await t.test('边缘运行时跳过 mmstat，避免吃掉 Infuse 的请求窗口', async () => {
+    const previousPlatform = Globals.deployPlatform;
+    Globals.deployPlatform = 'cloudflare';
+    try {
+      const source = new YoukuSource();
+      const { fetchImpl, calls } = buildYoukuFetch();
+      const comments = await withMockFetch(fetchImpl, () => source.getComments(youkuUrl, 'youku', false));
+
+      assert.ok(comments.length > 0);
+      assert.equal(calls.mmstat, 0);
+      assert.equal(calls.token, 1);
+    } finally {
+      Globals.deployPlatform = previousPlatform;
+    }
+  });
+
   await t.test('mmstat 被拦截时改用本地 cna 继续取弹幕，且后续不再请求该域名', async () => {
     const source = new YoukuSource();
     const { fetchImpl, calls } = buildYoukuFetch({ mmstatFails: true });

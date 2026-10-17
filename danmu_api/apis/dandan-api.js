@@ -61,6 +61,27 @@ const tmdbSource = getSourceByKey('tmdb');
 // 用于聚合请求的去重Map
 const PENDING_DANMAKU_REQUESTS = new Map();
 
+// Infuse 的单集查找请求默认只等待约 10 秒。普通搜索可以等待所有配置源，
+// 但单集请求若被一个慢源拖住，客户端会在拿到已有结果前主动取消请求。
+// 这里只对内部标记的 episode lookup 生效，不改变普通搜索的完整聚合语义。
+const INFUSE_EPISODE_LOOKUP_TIMEOUT_MS = 6500;
+
+function withEpisodeLookupTimeout(promise, source) {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      const error = new Error(`episode lookup source timed out: ${source}`);
+      error.code = 'EPISODE_LOOKUP_TIMEOUT';
+      reject(error);
+    }, INFUSE_EPISODE_LOOKUP_TIMEOUT_MS);
+  });
+
+  // 超时只截断当前等待，不取消底层源请求；为其附加 rejection handler，
+  // 避免边缘运行时在源请求稍后失败时产生未处理 Promise rejection。
+  Promise.resolve(promise).catch(() => {});
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutId));
+}
+
 function resolveCommentCacheKey(url) {
   const value = String(url || "");
   if (!globals.hongguoMergeAllEpisodes) return url;
@@ -501,6 +522,7 @@ async function searchAnimeBody(
   querySeason = querySeason ? parseInt(querySeason, 10) : null;
   let queryEpisode = url.searchParams.get("episode");
   queryEpisode = queryEpisode ? parseInt(queryEpisode, 10) : null;
+  const isEpisodeLookup = url.searchParams.get('episodeLookup') === '1';
   let tmdbSeasonBoundaries = null;
   log("info", `[system] [searchAnime] Search anime with keyword: ${queryTitle}, target season: ${querySeason}, target episode: ${queryEpisode}`);
 
@@ -776,10 +798,13 @@ async function searchAnimeBody(
     const pipelineTasks = sourceOrder.map(source => {
       const isolatedAnimes = [];
       const isolatedDetailStore = new Map();
-      const pipelinePromise = sourceSearchMap[source].then(async searchResult => {
+      const rawPipelinePromise = sourceSearchMap[source].then(async searchResult => {
         resultData[source] = searchResult;
         await executeSourceHandlers({ [source]: searchResult }, queryTitle, isolatedAnimes, isolatedDetailStore, querySeason, preferAnimeId, preferSource, sourceOrder);
       });
+      const pipelinePromise = isEpisodeLookup
+        ? withEpisodeLookupTimeout(rawPipelinePromise, source)
+        : rawPipelinePromise;
       return { key: source, animes: isolatedAnimes, detailStore: isolatedDetailStore, promise: pipelinePromise };
     });
 
@@ -792,7 +817,12 @@ async function searchAnimeBody(
 
     for (let i = 0; i < pipelineTasks.length; i++) {
       if (pipelineResults[i].status === 'rejected') {
-        log("error", `[system] [searchAnime] 源 ${pipelineTasks[i].key} 管道处理失败: ${pipelineResults[i].reason}`);
+        const reason = pipelineResults[i].reason;
+        if (reason?.code === 'EPISODE_LOOKUP_TIMEOUT') {
+          log("warn", `[system] [searchAnime] 单集查找跳过慢源 ${pipelineTasks[i].key}: ${reason.message}`);
+        } else {
+          log("error", `[system] [searchAnime] 源 ${pipelineTasks[i].key} 管道处理失败: ${reason}`);
+        }
         continue;
       }
 
@@ -2328,6 +2358,9 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
 
   // 先搜索动漫
   let searchUrl = buildSearchAnimeUrl(url, anime);
+  // 仅供内部 searchAnime 使用：让单集请求在 Infuse 超时前返回已完成的源，
+  // 不把 episode 参数误传给搜索源，也不改变普通 /search/anime 行为。
+  searchUrl.searchParams.set('episodeLookup', '1');
   const requestAnimeDetailsMap = new Map();
 
   const searchRes = await searchAnimeFn(searchUrl, null, null, requestAnimeDetailsMap);
@@ -2343,6 +2376,7 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
     for (const aliasTitle of aliasSearchTitles) {
       try {
         const aliasUrl = buildSearchAnimeUrl(url, aliasTitle);
+        aliasUrl.searchParams.set('episodeLookup', '1');
         const aliasRes = await searchAnimeFn(aliasUrl, null, null, requestAnimeDetailsMap);
         const aliasData = await aliasRes.json();
         searchData = mergeEpisodeSearchResults(searchData, aliasData);
