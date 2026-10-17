@@ -10,6 +10,7 @@ import {
   setPreferByAnimeId, getPreferAnimeId, hasLegacySeasonPreference, setPreferForTitle, storeAnimeIdsToMap,
   cleanupExpiredIPs, removeEarliestAnime, removeEpisodeByUrl, getEpisodeIdFloor,
   canPersistCacheKey, mergeAddAnimeError, queryCacheKeys,
+  persistEdgeEpisodeMappings, getEdgeEpisodeMapping,
 } from '../../utils/cache-util.js';
 
 const reset = (extra = {}) => {
@@ -30,6 +31,43 @@ const makeAnime = (animeId, { source = 'tencent', links = [], title = `番剧${a
   animeTitle: title,
   source,
   links,
+});
+
+test('cache-util Cloudflare 兜底：跨 isolate 保存并恢复 episode URL 映射', async () => {
+  reset();
+  const previousCaches = globalThis.caches;
+  const entries = new Map();
+  globalThis.caches = {
+    default: {
+      async put(request, response) {
+        entries.set(request.url, response.clone());
+      },
+      async match(request) {
+        const response = entries.get(request.url);
+        return response ? response.clone() : undefined;
+      },
+    },
+  };
+
+  try {
+    const stored = await persistEdgeEpisodeMappings([{
+      id: 10008,
+      url: 'https://v.qq.com/x/cover/test/episode.html',
+      title: '【qq】 测试_01',
+      animeTitle: '美人余(2026)【国产剧】from tencent',
+    }, { id: 10009, url: '' }]);
+    assert.equal(stored, 1);
+    assert.deepEqual(await getEdgeEpisodeMapping(10008), {
+      id: '10008',
+      url: 'https://v.qq.com/x/cover/test/episode.html',
+      title: '【qq】 测试_01',
+      animeTitle: '美人余(2026)【国产剧】from tencent',
+    });
+    assert.equal(await getEdgeEpisodeMapping(10009), null);
+  } finally {
+    if (previousCaches === undefined) delete globalThis.caches;
+    else globalThis.caches = previousCaches;
+  }
 });
 
 test('cache-util 弹幕缓存：命中返回评论、低于最小条数或过期则作废', () => {

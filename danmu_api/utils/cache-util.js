@@ -20,6 +20,95 @@ async function loadFileCacheModules() {
 // 用于存储最后一次搜索的上下文 (IP -> Context)
 const lastSearchMap = new Map();
 
+// Cloudflare Workers 的全局内存只在当前 isolate 内有效。
+// Infuse 的 search/episodes 和 comment/{episodeId} 可能落到不同 isolate，
+// 因此在没有 Redis/KV 时，用 Workers Cache API 保存一份短期的 episode -> URL 映射。
+// 这是无外部依赖的兜底；配置了 Upstash Redis 时仍由 Redis 提供跨请求、跨节点的持久化。
+const EDGE_EPISODE_CACHE_PREFIX = 'https://danmu-api-episode-cache.invalid/v1/';
+const EDGE_EPISODE_CACHE_TTL = 7 * 24 * 60 * 60;
+
+function getEdgeEpisodeCache() {
+    try {
+        return globalThis.caches?.default || null;
+    } catch {
+        return null;
+    }
+}
+
+function getEdgeEpisodeCacheKey(id) {
+    if (typeof Request !== 'function') return null;
+    const value = String(id ?? '').trim();
+    return value ? new Request(`${EDGE_EPISODE_CACHE_PREFIX}${encodeURIComponent(value)}`) : null;
+}
+
+/**
+ * 将本次搜索返回的剧集映射写入 Cloudflare Cache API。
+ * @param {Array<{id: string|number, url: string, title?: string, animeTitle?: string}>} mappings
+ * @returns {Promise<number>} 成功写入的映射数量
+ */
+export async function persistEdgeEpisodeMappings(mappings = []) {
+    const cache = getEdgeEpisodeCache();
+    if (!cache || !Array.isArray(mappings) || mappings.length === 0) return 0;
+
+    let storedCount = 0;
+    await Promise.all(mappings.map(async mapping => {
+        const id = String(mapping?.id ?? '').trim();
+        const url = typeof mapping?.url === 'string' ? mapping.url.trim() : '';
+        const key = getEdgeEpisodeCacheKey(id);
+        if (!key || !url) return;
+
+        const payload = {
+            id,
+            url,
+            title: mapping?.title ? String(mapping.title) : '',
+            animeTitle: mapping?.animeTitle ? String(mapping.animeTitle) : '',
+        };
+
+        try {
+            await cache.put(key, new Response(JSON.stringify(payload), {
+                status: 200,
+                headers: {
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Cache-Control': `public, max-age=${EDGE_EPISODE_CACHE_TTL}`,
+                },
+            }));
+            storedCount += 1;
+        } catch (error) {
+            // Cache API 只是兜底，写入失败不能影响 Infuse 的搜索响应。
+            log('warn', `[cache] Edge episode mapping write failed: ${error.message}`);
+        }
+    }));
+
+    return storedCount;
+}
+
+/**
+ * 从 Cloudflare Cache API 恢复跨 isolate 的剧集映射。
+ * @param {string|number} id
+ * @returns {Promise<{id: string, url: string, title: string, animeTitle: string}|null>}
+ */
+export async function getEdgeEpisodeMapping(id) {
+    const cache = getEdgeEpisodeCache();
+    const key = getEdgeEpisodeCacheKey(id);
+    if (!cache || !key) return null;
+
+    try {
+        const response = await cache.match(key);
+        if (!response) return null;
+        const payload = await response.json();
+        if (!payload || typeof payload.url !== 'string' || !payload.url.trim()) return null;
+        return {
+            id: String(payload.id ?? id),
+            url: payload.url.trim(),
+            title: payload.title ? String(payload.title) : '',
+            animeTitle: payload.animeTitle ? String(payload.animeTitle) : '',
+        };
+    } catch (error) {
+        log('warn', `[cache] Edge episode mapping read failed: ${error.message}`);
+        return null;
+    }
+}
+
 export function setLastSearch(ip, data) {
     lastSearchMap.set(ip, { ...data, timestamp: Date.now() });
     // 简单的清理逻辑：如果map太大，清理一半

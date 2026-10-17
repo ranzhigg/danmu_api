@@ -7,7 +7,8 @@ import { setLocalRedisKey, updateLocalRedisCaches } from "../utils/local-redis-u
 import {
     setCommentCache, addAnime, findAnimeIdByCommentId, findTitleById, findUrlById, getCommentCache, getPreferAnimeId,
     getSearchCache, removeEarliestAnime, resolveAnimeById, resolveAnimeByIdFromDetailStore, setPreferByAnimeId, setPreferForTitle, setSearchCache, storeAnimeIdsToMap, writeCacheToFile,
-    updateLocalCaches, setLastSearch, getLastSearch, findAnimeTitleById, findIndexById, hasSeasonSpecificPreference, hasLegacySeasonPreference, getAddAnimeError, mergeAddAnimeError
+    updateLocalCaches, setLastSearch, getLastSearch, findAnimeTitleById, findIndexById, hasSeasonSpecificPreference, hasLegacySeasonPreference, getAddAnimeError, mergeAddAnimeError,
+    persistEdgeEpisodeMappings, getEdgeEpisodeMapping
 } from "../utils/cache-util.js";
 import { resolveFavoriteForSearchKeyword } from "../utils/favorite-util.js";
 import { formatDanmuResponse, convertToDanmakuJson } from "../utils/danmu-util.js";
@@ -2224,6 +2225,17 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
 
   log("info", `[system] [episodes] Found ${resultAnimes.length} animes with filtered episodes`);
 
+  // Infuse 会在后续请求中只携带 episodeId。Cloudflare 的无状态 isolate
+  // 可能与搜索请求不同，不能只依赖 globals.episodeIds 的进程内映射。
+  await persistEdgeEpisodeMappings(resultAnimes.flatMap(animeItem =>
+    (animeItem.episodes || []).map(episodeItem => ({
+      id: episodeItem.episodeId,
+      url: episodeItem.url,
+      title: episodeItem.episodeTitle,
+      animeTitle: animeItem.animeTitle,
+    }))
+  ));
+
   return jsonResponse({
     errorCode: 0,
     success: true,
@@ -2246,7 +2258,14 @@ export async function getBangumi(path, detailStore = null, source = null) {
       404
     );
   }
-  return jsonResponse(buildBangumiData(anime, idParam));
+  const bangumiData = buildBangumiData(anime, idParam);
+  await persistEdgeEpisodeMappings((bangumiData.bangumi?.episodes || []).map(episode => ({
+    id: episode.episodeId,
+    url: episode.url,
+    title: episode.episodeTitle,
+    animeTitle: bangumiData.bangumi?.animeTitle,
+  })));
+  return jsonResponse(bangumiData);
 }
 
 function buildBangumiData(anime, idParam = "") {
@@ -2536,6 +2555,15 @@ export async function getComment(path, queryFormat, segmentFlag, clientIp, inclu
   let animeTitle = findAnimeTitleById(commentId);
   let url = findUrlById(commentId);
   let title = findTitleById(commentId);
+  if (!url) {
+    const edgeMapping = await getEdgeEpisodeMapping(commentId);
+    if (edgeMapping) {
+      url = edgeMapping.url;
+      title ||= edgeMapping.title;
+      animeTitle ||= edgeMapping.animeTitle;
+      log("info", `[system] [LogVar-API] Restored episode ${commentId} from edge cache`);
+    }
+  }
   let plat = title ? extractEpisodeTitle(title) : null;
   if (url?.startsWith('local:')) {
     return getCommentByUrl(url, queryFormat, segmentFlag, includeDuration);
