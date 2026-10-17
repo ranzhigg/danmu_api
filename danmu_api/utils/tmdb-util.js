@@ -112,6 +112,65 @@ export async function getTmdbExternalIds(mediaType, tmdbId, options = {}) {
   return await tmdbApiGet(url, options);
 }
 
+/**
+ * 通过 TMDB ID 获取可用于弹弹play搜索的标题。
+ *
+ * Infuse 等客户端调用 /api/v2/search/episodes 时可能只携带 tmdbId，
+ * 不携带 anime 关键词。TMDB 的详情接口按 zh-CN 返回中文名，若没有中文名
+ * 则回退到原名，交由现有的多平台搜索链路继续处理。
+ *
+ * @param {string|number} tmdbId TMDB 数字 ID
+ * @param {"tv"|"movie"} preferredMediaType 优先尝试的媒体类型
+ * @param {{signal?: AbortSignal}} options 请求选项
+ * @returns {Promise<{id:number, mediaType:string, title:string, originalTitle:string}|null>}
+ */
+export async function getTmdbMediaTitleById(tmdbId, preferredMediaType = 'tv', options = {}) {
+  const id = String(tmdbId ?? '').trim();
+  if (!/^\d+$/.test(id)) return null;
+
+  if (!globals.tmdbApiKey) {
+    log('warn', '[system] [tmdb] 未配置 TMDB_API_KEY，无法解析 tmdbId 对应标题');
+    return null;
+  }
+
+  const firstType = preferredMediaType === 'movie' ? 'movie' : 'tv';
+  const mediaTypes = [firstType, firstType === 'tv' ? 'movie' : 'tv'];
+
+  for (const mediaType of mediaTypes) {
+    try {
+      const response = await tmdbApiGet(
+        `${mediaType}/${id}?api_key=${globals.tmdbApiKey}&language=zh-CN`,
+        options
+      );
+      if (!response?.data) continue;
+
+      const detail = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+      const title = mediaType === 'tv'
+        ? (detail.name || detail.original_name || '')
+        : (detail.title || detail.original_title || '');
+      if (!title) continue;
+
+      const originalTitle = mediaType === 'tv'
+        ? (detail.original_name || detail.name || '')
+        : (detail.original_title || detail.title || '');
+
+      log('info', `[system] [tmdb] 通过 ID 解析标题成功: ${id} (${mediaType}) -> ${title}`);
+      return {
+        id: Number(detail.id) || Number(id),
+        mediaType,
+        title,
+        originalTitle,
+      };
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+      log('info', `[system] [tmdb] 解析 ${mediaType}/${id} 失败，尝试其他媒体类型: ${error.message}`);
+    }
+  }
+
+  log('info', `[system] [tmdb] 未找到 tmdbId 对应标题: ${id}`);
+  return null;
+}
+
 // 使用 TMDB API 获取别名
 async function getTmdbAlternativeTitles(mediaType, tmdbId, options = {}) {
   const url = `${mediaType}/${tmdbId}/alternative_titles?api_key=${globals.tmdbApiKey}`;

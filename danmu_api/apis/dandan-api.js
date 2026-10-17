@@ -17,7 +17,7 @@ import {
   extractEpisodeTitle, convertChineseNumber, parseFileName, createDynamicPlatformOrder, normalizeTitleForMatch,
   extractYear, titleMatches, extractAnimeInfo, extractEpisodeNumberFromTitle, extractSeasonNumberFromAnimeTitle, extractAnimeTitle
 } from "../utils/common-util.js";
-import { getTMDBChineseTitle, getTmdbSeasonBoundaries } from "../utils/tmdb-util.js";
+import { getTMDBChineseTitle, getTmdbMediaTitleById, getTmdbSeasonBoundaries } from "../utils/tmdb-util.js";
 import { applyMergeLogic, mergeDanmakuList, MERGE_DELIMITER, alignSourceTimelines, sanitizeUrl } from "../utils/merge-util.js";
 import { getHanjutvSourceLabel } from "../utils/hanjutv-util.js";
 import AIClient from '../utils/ai-util.js';
@@ -2093,10 +2093,35 @@ export async function matchAnime(url, req, clientIp) {
   }
 }
 
+function normalizeTmdbId(rawValue) {
+  const value = String(rawValue || '').trim();
+  return /^\d+$/.test(value) ? value : '';
+}
+
+function resolveTmdbMediaType(url, episode) {
+  const tmdbIdType = url.searchParams.get('tmdbIdType');
+  if (tmdbIdType === '1') return 'movie';
+  if (tmdbIdType === '0') return 'tv';
+  return String(episode || '').toLowerCase() === 'movie' ? 'movie' : 'tv';
+}
+
 // Extracted function for GET /api/v2/search/episodes
-export async function searchEpisodes(url) {
-  let anime = url.searchParams.get("anime");
+// searchAnimeFn/tmdbTitleResolver 仅用于离线回归测试，不改变线上调用方式。
+export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitleResolver = getTmdbMediaTitleById) {
+  let anime = url.searchParams.get("anime") || "";
+  const tmdbId = normalizeTmdbId(url.searchParams.get('tmdbId'));
   const episode = url.searchParams.get("episode") || "";
+
+  // 弹弹play规范允许只传 tmdbId。Infuse 的请求正是这种形式，
+  // 先通过 TMDB 详情拿到可搜索标题，再复用现有的多平台搜索与集数过滤逻辑。
+  if (!anime && tmdbId) {
+    const mediaType = resolveTmdbMediaType(url, episode);
+    const tmdbMedia = await tmdbTitleResolver(tmdbId, mediaType);
+    anime = tmdbMedia?.title || '';
+    if (anime) {
+      log("info", `[system] [episodes] Resolved anime title from tmdbId ${tmdbId}: ${anime}`);
+    }
+  }
 
   // 如果启用了搜索关键字繁转简，则进行转换
   if (globals.animeTitleSimplified) {
@@ -2108,10 +2133,15 @@ export async function searchEpisodes(url) {
   log("info", `[system] [episodes] Search episodes with anime: ${anime}, episode: ${episode}`);
 
   if (!anime) {
-    log("error", "[system] [episodes] Missing anime parameter");
+    const errorMessage = tmdbId
+      ? "Unable to resolve anime title from tmdbId"
+      : "Missing anime or tmdbId parameter";
+    log("error", `[system] [episodes] ${errorMessage}`);
     return jsonResponse(
-      { errorCode: 400, success: false, errorMessage: "Missing anime parameter" },
-      400
+      tmdbId
+        ? { errorCode: 0, success: true, errorMessage: "", hasMore: false, animes: [] }
+        : { errorCode: 400, success: false, errorMessage },
+      tmdbId ? 200 : 400
     );
   }
 
@@ -2119,7 +2149,7 @@ export async function searchEpisodes(url) {
   let searchUrl = buildSearchAnimeUrl(url, anime);
   const requestAnimeDetailsMap = new Map();
 
-  const searchRes = await searchAnime(searchUrl, null, null, requestAnimeDetailsMap);
+  const searchRes = await searchAnimeFn(searchUrl, null, null, requestAnimeDetailsMap);
   const searchData = await searchRes.json();
 
   if (!searchData.success || !searchData.animes || searchData.animes.length === 0) {

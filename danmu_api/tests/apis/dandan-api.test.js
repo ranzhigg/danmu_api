@@ -6,7 +6,7 @@ dotenv.config();
 
 import test from 'node:test';
 import assert from 'node:assert';
-import { extractTitleSeasonEpisode, buildSearchAnimeUrl, matchSeason, matchAniAndEp, fallbackMatchAniAndEp } from '../../apis/dandan-api.js';
+import { extractTitleSeasonEpisode, buildSearchAnimeUrl, searchEpisodes, matchSeason, matchAniAndEp, fallbackMatchAniAndEp } from '../../apis/dandan-api.js';
 import { Globals } from '../../configs/globals.js';
 import { normalizeTitleForMatch } from '../../utils/common-util.js';
 import { urlPrefix } from '../helpers/context.js';
@@ -28,6 +28,60 @@ test('buildSearchAnimeUrl should derive /search/anime from /search/episodes requ
     assert.equal(searchUrl.searchParams.has('season'), false);
     assert.equal(searchUrl.searchParams.has('episode'), false);
   });
+
+test('searchEpisodes should accept Infuse-style tmdbId-only requests', async () => {
+  Globals.init({ LOG_LEVEL: 'error' });
+
+  const requestUrl = new URL(`${urlPrefix}/api/v2/search/episodes?tmdbId=300146&tmdbIdType=0&episode=1`);
+  const fakeSearchAnime = async (searchUrl, _preferAnimeId, _preferSource, detailStore) => {
+    assert.equal(searchUrl.searchParams.get('keyword'), '嫁金钗');
+
+    detailStore.set('detail', {
+      animeId: 7001,
+      bangumiId: '7001',
+      animeTitle: '嫁金钗(2026)【电视剧】',
+      type: 'tvseries',
+      typeDescription: '电视剧',
+      imageUrl: '',
+      startDate: '2026-01-01T00:00:00.000Z',
+      source: 'dandan',
+      links: [
+        { id: 700101, title: '第1集', url: 'https://example.com/episode-1' },
+        { id: 700102, title: '第2集', url: 'https://example.com/episode-2' },
+      ],
+    });
+
+    return new Response(JSON.stringify({
+      success: true,
+      animes: [{
+        animeId: 7001,
+        bangumiId: '7001',
+        animeTitle: '嫁金钗(2026)【电视剧】',
+        type: 'tvseries',
+        typeDescription: '电视剧',
+        source: 'dandan',
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  const response = await searchEpisodes(
+    requestUrl,
+    fakeSearchAnime,
+    async (tmdbId, mediaType) => {
+      assert.equal(tmdbId, '300146');
+      assert.equal(mediaType, 'tv');
+      return { title: '嫁金钗', mediaType: 'tv' };
+    },
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.success, true);
+  assert.equal(body.animes.length, 1);
+  assert.equal(body.animes[0].animeId, 7001);
+  assert.equal(body.animes[0].episodes.length, 1);
+  assert.equal(body.animes[0].episodes[0].episodeId, 700101);
+});
   // 测试标题解析
 test('PARSE TitleSeasonEpisode', async () => {
     let title, season, episode;
