@@ -89,6 +89,7 @@ test('youku source falls back to a locally generated cna', async (t) => {
 
     const first = await withMockFetch(fetchImpl, () => source.getComments(youkuUrl, 'youku', false));
     assert.ok(first.length > 0, 'mmstat 失败后仍应取到弹幕');
+    assert.ok(first.every(item => typeof item.m === 'string' && item.m.trim()), '最终输出必须包含弹幕正文 m');
     assert.equal(calls.mmstat, 1);
 
     const second = await withMockFetch(fetchImpl, () => source.getComments(youkuUrl, 'youku', false));
@@ -103,6 +104,34 @@ test('youku source falls back to a locally generated cna', async (t) => {
     const comments = await withMockFetch(fetchImpl, () => source.getComments(youkuUrl, 'youku', false));
     assert.ok(comments.length > 0);
     assert.equal(calls.mmstat, 1);
+  });
+
+  await t.test('优酷正文统一输出到 m，兼容新旧正文字段并忽略用户昵称', async () => {
+    const source = new YoukuSource();
+    const formatted = source.formatComments([
+      { playat: 1000, content: '正文内容', name: '用户昵称' },
+      { playat: 2000, text: '兼容正文', nick: '另一个昵称' },
+      { playat: 3000, content: '', message: '备用正文', userName: '用户昵称' },
+      { playat: 4000, content: '', name: '只有昵称' },
+    ]);
+
+    assert.deepEqual(formatted.map(item => item.m), ['正文内容', '兼容正文', '备用正文']);
+    assert.deepEqual(formatted.map(item => item.content), ['正文内容', '兼容正文', '备用正文']);
+
+    const output = source.formatComments([
+      { playat: 1000, content: '最终正文', propertis: '{"pos":"1","color":"#ff0000"}' },
+    ]);
+    assert.deepEqual(output[0], {
+      timepoint: 1,
+      ct: 5,
+      size: 25,
+      color: 16711680,
+      unixtime: output[0].unixtime,
+      uid: 0,
+      content: '最终正文',
+      m: '最终正文',
+      like: 0,
+    });
   });
 
   await t.test('mtop token 获取失败时返回空结果而不是抛错', async () => {

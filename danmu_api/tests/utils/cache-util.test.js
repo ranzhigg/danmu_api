@@ -58,6 +58,15 @@ test('cache-util 弹幕缓存：命中返回评论、低于最小条数或过期
   reset({ COMMENT_CACHE_MINUTES: '30', COMMENT_CACHE_MIN_COUNT: '0' });
   setCommentCache(few, [{ m: 'only' }]);
   assert.strictEqual(isCommentCacheValid(few), true, 'COMMENT_CACHE_MIN_COUNT=0 表示不限条数');
+
+  // 旧版本缓存缺少 m 字段时必须失效，避免播放器只显示来源名称而没有正文。
+  const legacy = 'https://v.youku.com/v_show/id_legacy.html';
+  Globals.commentCache.set(legacy, {
+    comments: [{ p: '1,1,16777215,youku', content: '旧格式正文' }],
+    timestamp: Date.now(),
+  });
+  assert.strictEqual(isCommentCacheValid(legacy), false, 'legacy content 缓存应强制刷新');
+  assert.strictEqual(Globals.commentCache.has(legacy), false, 'legacy 缓存应被删除');
 });
 
 test('cache-util 弹幕缓存：容量兜底按插入顺序淘汰最早条目', () => {

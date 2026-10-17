@@ -376,6 +376,16 @@ export function isCommentCacheValid(videoUrl) {
     const commentCount = Array.isArray(cached.comments) ? cached.comments.length : 0;
     const minCount = Math.max(0, globals.commentCacheMinCount || 0);
 
+    // 旧版本曾把源字段 content 直接写入缓存，没有规范化成 DanDanPlay 要求的 m。
+    // 这类缓存仍可能“有条数”，但播放器只能列出来源/名称而渲染不出正文，必须强制刷新。
+    if (commentCount > 0 && cached.comments.some(comment => (
+        typeof comment?.m !== 'string' || comment.m.trim().length === 0
+    ))) {
+        globals.commentCache.delete(videoUrl);
+        log("info", `[cache] Comment cache for "${videoUrl}" has legacy or empty text fields, refreshing`);
+        return false;
+    }
+
     if (minCount > 0 && commentCount < minCount) {
         globals.commentCache.delete(videoUrl);
         log("info", `[cache] Comment cache for "${videoUrl}" has only ${commentCount} comments (minimum ${minCount}), refreshing`);
