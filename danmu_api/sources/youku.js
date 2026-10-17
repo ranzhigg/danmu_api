@@ -553,8 +553,13 @@ export default class YoukuSource extends BaseSource {
 
     let contents = [];
 
-    // 并发限制（可通过环境变量 YOUKU_CONCURRENCY 配置，默认 8）
-    const concurrency = Math.max(1, Number(globals.youkuConcurrency) || 8);
+    // Cloudflare 首次请求必须在 Infuse 的 10 秒窗口内完成。
+    // 电视单集通常有几十个 60 秒分片，边缘运行时继续按 8 个一批串行会
+    // 把总耗时线性放大；提高批次并发，仍保留本地运行时的原配置行为。
+    const configuredConcurrency = Math.max(1, Number(globals.youkuConcurrency) || 8);
+    const concurrency = isServerlessRuntime()
+      ? Math.max(32, configuredConcurrency)
+      : configuredConcurrency;
     const segments = [...segmentList];
 
     for (let i = 0; i < segments.length; i += concurrency) {
@@ -588,6 +593,31 @@ export default class YoukuSource extends BaseSource {
     printFirst200Chars(contents);
 
     return contents;
+  }
+
+  async _getMtopToken() {
+    const tkEncUrl = "https://acs.youku.com/h5/mtop.com.youku.aplatform.weakget/1.0/?jsv=2.5.1&appKey=24679788";
+    const tkEncRes = await httpGet(tkEncUrl, youkuRequestOptions({
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
+      },
+      allow_redirects: false
+    }));
+    const tkEncSetCookie = tkEncRes?.headers?.["set-cookie"] || tkEncRes?.headers?.["Set-Cookie"] || "";
+
+    const tkEncMatch = tkEncSetCookie.match(/_m_h5_tk_enc=([^;]+)/);
+    const mtopTokenEnc = tkEncMatch ? tkEncMatch[1] : null;
+    const tkH5Match = tkEncSetCookie.match(/_m_h5_tk=([^;]+)/);
+    const mtopToken = tkH5Match ? tkH5Match[1] : null;
+
+    if (!mtopToken || !mtopTokenEnc) {
+      throw new Error('未获取到有效的 mtop token');
+    }
+
+    log("info", `[youku] _m_h5_tk_enc: ${mtopTokenEnc}`);
+    log("info", `[youku] _m_h5_tk: ${mtopToken}`);
+    return { _m_h5_tk: mtopToken, _m_h5_tk_enc: mtopTokenEnc };
   }
 
   async getEpisodeDanmuSegments(id) {
@@ -628,6 +658,11 @@ export default class YoukuSource extends BaseSource {
     const video_id = path[path.length - 1].split(".")[0].slice(3);
 
     log("info", `[youku] video_id: ${video_id}`);
+
+    // 视频信息与 mtop token 互不依赖，边缘运行时并行请求，避免两个上游
+    // 延迟相加；token promise 先挂 rejection handler，防止视频信息异常时泄漏。
+    const tokenPromise = this._getMtopToken();
+    tokenPromise.catch(() => {});
 
     // 获取页面标题和视频时长
     let res;
@@ -701,27 +736,11 @@ export default class YoukuSource extends BaseSource {
     }
 
     // 获取 tk_enc / _m_h5_tk（mtop 签名 token 由服务端下发，无法本地生成）
+    let tokenData;
     try {
-      const tkEncUrl = "https://acs.youku.com/h5/mtop.com.youku.aplatform.weakget/1.0/?jsv=2.5.1&appKey=24679788";
-      const tkEncRes = await httpGet(tkEncUrl, youkuRequestOptions({
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
-          },
-          allow_redirects: false
-        }));
-      const tkEncSetCookie = tkEncRes?.headers?.["set-cookie"] || tkEncRes?.headers?.["Set-Cookie"] || "";
-
-      // 获取 _m_h5_tk_enc
-      const tkEncMatch = tkEncSetCookie.match(/_m_h5_tk_enc=([^;]+)/);
-      _m_h5_tk_enc = tkEncMatch ? tkEncMatch[1] : null;
-
-      // 获取 _m_h5_tkh
-      const tkH5Match = tkEncSetCookie.match(/_m_h5_tk=([^;]+)/);
-      _m_h5_tk = tkH5Match ? tkH5Match[1] : null;
-
-      log("info", `[youku] _m_h5_tk_enc: ${_m_h5_tk_enc}`);
-      log("info", `[youku] _m_h5_tk: ${_m_h5_tk}`);
+      tokenData = await tokenPromise;
+      _m_h5_tk = tokenData._m_h5_tk;
+      _m_h5_tk_enc = tokenData._m_h5_tk_enc;
     } catch (error) {
       log("error", "[youku] 获取 tk_enc 失败:", error);
       return this._emptySegmentList();

@@ -34,6 +34,10 @@ Last reviewed: 2026-10-18
 - In edge/serverless runtimes, Youku uses a local cna immediately, bounds each
   upstream request to 4 seconds, and disables the extra retry. The local cna is
   only a client identifier and does not change the comment payload.
+- Video metadata and the mtop token are requested in parallel. Segment
+  requests use a larger edge batch (at least 32 concurrent segments) because
+  the old eight-at-a-time serial batches made a 40–50 minute episode exceed
+  Infuse's request window even when every segment contained valid comments.
 - The token request no longer loops on an empty response. It fails closed and
   returns an empty segment list when the upstream token is unavailable.
 
