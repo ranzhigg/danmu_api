@@ -58,15 +58,19 @@ export class Anime {
 class Link {
   constructor(rawJson = {}) {
     const {
-      name = "", url = "", title = "", id = 10001
+      name = "", url = "", title = "", id = 10001,
+      episodeNumber = null, sort = null
     } = nullToUndefined(rawJson);
     validateType(name, "string", "name");
     validateType(url, "string", "url");
     validateType(title, "string", "title");
     validateType(id, "number", "id");
 
-    // 直接解构并赋值给 this
+    // 保留源站提供的集数/排序元数据。部分电视剧源的 links 顺序包含预告、花絮，
+    // 仅按数组下标重建集数会导致 Infuse 请求第 N 集时拿到错误或空结果。
     Object.assign(this, { name, url, title, id });
+    if (episodeNumber !== null && episodeNumber !== undefined) this.episodeNumber = episodeNumber;
+    if (sort !== null && sort !== undefined) this.sort = sort;
   }
 
   // ---- 静态方法：从 JSON 创建 Link 对象 ----

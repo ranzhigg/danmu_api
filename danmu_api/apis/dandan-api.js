@@ -2165,6 +2165,17 @@ const DIRECT_FALLBACK_SOURCE_ORDER = Object.freeze([
   'imgo',
   'bilibili',
   'migu',
+  'sohu',
+  'leshi',
+  'xigua',
+  'maiduidui',
+  'aiyifan',
+  'hongguo',
+  'other',
+  'dandan',
+  'bahamut',
+  'animeko',
+  'custom',
 ]);
 
 function resolveMissingDirectFallbackSources() {
@@ -2203,6 +2214,32 @@ function isFeatureRequest(url, episode) {
 function isEditorialTitle(value) {
   const text = String(value || '').toLowerCase();
   return FEATURE_EDITORIAL_MARKERS.some(marker => text.includes(marker));
+}
+
+function selectRequestedEpisodes(episodes, targetEpisode) {
+  const usableEpisodes = (episodes || []).filter(ep => !isEditorialTitle(ep?.episodeTitle));
+  const target = Number(targetEpisode);
+  if (!Number.isInteger(target) || target < 1) return [];
+
+  // 先相信标题中的明确集数。这样即使源站把预告/花絮插在正片前面，或返回顺序不是
+  // 第 1 集开始，也不会把数组下标误当成集数。
+  const titleNumberedEpisodes = usableEpisodes.filter(ep =>
+    extractEpisodeNumberFromTitle(ep?.episodeTitle) !== null
+  );
+  const titleMatches = titleNumberedEpisodes.filter(ep =>
+    extractEpisodeNumberFromTitle(ep?.episodeTitle) === target
+  );
+  if (titleMatches.length > 0) return titleMatches;
+
+  // 标题没有明确集数时，使用源站保留下来的 episodeNumber/sort 元数据。
+  const metadataMatches = usableEpisodes.filter(ep => Number(ep?.episodeNumber) === target);
+  if (metadataMatches.length > 0) return metadataMatches;
+
+  // 最后才使用过滤后的数组位置；仅当整组结果都没有显式集数时启用，避免错误兜底。
+  if (titleNumberedEpisodes.length === 0 && usableEpisodes.length >= target) {
+    return [usableEpisodes[target - 1]];
+  }
+  return [];
 }
 
 function isFeatureCandidate(animeItem, requestedYear = null) {
@@ -2245,6 +2282,7 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
   const episode = url.searchParams.get("episode") || "";
   const featureRequest = isFeatureRequest(url, episode);
   let requestedYear = null;
+  let tmdbTitleCandidates = [];
 
   // 弹弹play规范允许只传 tmdbId。Infuse 的请求正是这种形式，
   // 先通过 TMDB 详情拿到可搜索标题，再复用现有的多平台搜索与集数过滤逻辑。
@@ -2252,6 +2290,9 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
     const mediaType = resolveTmdbMediaType(url, episode);
     const tmdbMedia = await tmdbTitleResolver(tmdbId, mediaType);
     anime = tmdbMedia?.title || '';
+    tmdbTitleCandidates = [tmdbMedia?.title, tmdbMedia?.originalTitle]
+      .map(title => String(title || '').trim())
+      .filter(Boolean);
     requestedYear = Number.isInteger(tmdbMedia?.year) ? tmdbMedia.year : null;
     if (anime) {
       log("info", `[system] [episodes] Resolved anime title from tmdbId ${tmdbId}: ${anime}`);
@@ -2263,7 +2304,12 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
     const simplifiedTitle = simplized(anime);
     log("info", `[system] [episodes] searchEpisodes converted traditional to simplified: ${anime} -> ${simplifiedTitle}`);
     anime = simplifiedTitle;
+    tmdbTitleCandidates = tmdbTitleCandidates.map(title => simplized(title));
   }
+
+  tmdbTitleCandidates = [...new Set([anime, ...tmdbTitleCandidates]
+    .map(title => String(title || '').trim())
+    .filter(title => title.length > 0))];
 
   log("info", `[system] [episodes] Search episodes with anime: ${anime}, episode: ${episode}`);
 
@@ -2287,15 +2333,34 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
   const searchRes = await searchAnimeFn(searchUrl, null, null, requestAnimeDetailsMap);
   let searchData = await searchRes.json();
 
+  // TMDB 的中文标题不一定是源站使用的标题；影视剧尤其常见英文原名、繁体名或
+  // 地区译名不一致。仅在首轮没有候选时尝试原名，避免每次请求都扩大搜索扇出。
+  const aliasSearchTitles = tmdbTitleCandidates.filter(title => title !== anime);
+  let aliasSearchAttempted = false;
+  const searchTitleAliases = async () => {
+    if (aliasSearchAttempted || aliasSearchTitles.length === 0) return;
+    aliasSearchAttempted = true;
+    for (const aliasTitle of aliasSearchTitles) {
+      try {
+        const aliasUrl = buildSearchAnimeUrl(url, aliasTitle);
+        const aliasRes = await searchAnimeFn(aliasUrl, null, null, requestAnimeDetailsMap);
+        const aliasData = await aliasRes.json();
+        searchData = mergeEpisodeSearchResults(searchData, aliasData);
+        log("info", `[system] [episodes] TMDB alias search "${aliasTitle}" returned ${(aliasData?.animes || []).length} candidates`);
+      } catch (error) {
+        log("warn", `[system] [episodes] TMDB alias search failed for "${aliasTitle}": ${error.message}`);
+      }
+    }
+  };
+
+  if (!searchData?.animes?.length) await searchTitleAliases();
+
   // 豆瓣未收录或未返回平台关联时，默认源可能只给出 360 的解说/专访条目。
   // 单集媒体端点补查未配置的直连视频源，并合并所有候选，让 Infuse 可以手动选源。
   // sourceOrderOverride 不会改写全局配置；电视剧先走默认源，只有没有目标集数时才补查直连源。
   const fallbackSourceOrder = resolveMissingDirectFallbackSources();
   const needsFeatureFallback = featureRequest
     && fallbackSourceOrder.length > 0;
-  const needsEmptyResultFallback = !featureRequest
-    && fallbackSourceOrder.length > 0
-    && (!searchData?.success || !Array.isArray(searchData?.animes) || searchData.animes.length === 0);
   let fallbackAttempted = false;
   const searchDirectFallback = async () => {
     if (fallbackAttempted || fallbackSourceOrder.length === 0) return;
@@ -2317,7 +2382,9 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
       log("warn", `[system] [episodes] Direct fallback source search failed: ${error.message}`);
     }
   };
-  if (needsFeatureFallback || needsEmptyResultFallback) {
+  const hasEmptySearchResult = () =>
+    !searchData?.success || !Array.isArray(searchData?.animes) || searchData.animes.length === 0;
+  if (needsFeatureFallback || (!featureRequest && fallbackSourceOrder.length > 0 && hasEmptySearchResult())) {
     await searchDirectFallback();
   }
 
@@ -2363,11 +2430,8 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
             !isEditorialTitle(`${animeItem.animeTitle} ${ep.episodeTitle}`)
           );
         } else if (/^\d+$/.test(episode)) {
-          // 电视剧/动漫的纯数字请求，仅保留指定集数
-          const targetEpisode = parseInt(episode);
-          filteredEpisodes = bangumiData.bangumi.episodes.filter(ep =>
-            parseInt(ep.episodeNumber) === targetEpisode
-          );
+          // 电视剧/动漫的纯数字请求，按标题/源站元数据/过滤后位置依次匹配。
+          filteredEpisodes = selectRequestedEpisodes(bangumiData.bangumi.episodes, episode);
         }
 
         // 只有当过滤后还有集数时才添加到结果中
@@ -2395,6 +2459,10 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
   // 默认源可能返回了剧名，但没有请求集数（常见于新剧、跨平台集数不同、
   // 或 TMDB 中文名与源站标题略有差异）。只有此时再补查直连源，避免每次播放都放大请求量。
   if (!featureRequest && /^\d+$/.test(episode) && resultAnimes.length === 0) {
+    await searchTitleAliases();
+    if (searchData?.animes?.length > 0) {
+      resultAnimes = await collectEpisodeResults(searchData);
+    }
     await searchDirectFallback();
     if (searchData?.animes?.length > 0) {
       resultAnimes = await collectEpisodeResults(searchData);
@@ -2436,11 +2504,16 @@ function buildBangumiData(anime, idParam = "") {
   let episodesList = [];
   for (let i = 0; i < anime.links.length; i++) {
     const link = anime.links[i];
+    const titleEpisodeNumber = extractEpisodeNumberFromTitle(link.title);
+    const metadataEpisodeNumber = Number.isFinite(Number(link.episodeNumber))
+      ? Number(link.episodeNumber)
+      : (Number.isFinite(Number(link.sort)) ? Number(link.sort) : null);
+    const episodeNumber = titleEpisodeNumber ?? metadataEpisodeNumber ?? (i + 1);
     episodesList.push({
       seasonId: `season-${anime.animeId}`,
       episodeId: link.id,
       episodeTitle: `${link.title}`,
-      episodeNumber: `${anime.source === 'local' ? (extractEpisodeNumberFromTitle(link.title) ?? i + 1) : i + 1}`,
+      episodeNumber: `${episodeNumber}`,
       airDate: anime.startDate,
       url: link.url || ""
     });
@@ -2464,10 +2537,13 @@ function buildBangumiData(anime, idParam = "") {
       };
     }
 
-    // 重新排序episodeNumber
+    // 重新排序 episodeNumber。若源站已经给出显式集数，则保留它；否则按过滤后的
+    // 顺序连续编号，兼容旧源的无编号 links。
     episodesList = episodesList.map((episode, index) => ({
       ...episode,
-      episodeNumber: anime.source === 'local' ? episode.episodeNumber : `${index+1}`
+      episodeNumber: extractEpisodeNumberFromTitle(episode.episodeTitle) !== null
+        ? episode.episodeNumber
+        : `${index + 1}`
     }));
   }
 
