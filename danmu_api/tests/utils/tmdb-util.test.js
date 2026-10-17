@@ -11,8 +11,29 @@ import path from 'node:path';
 import { Globals } from '../../configs/globals.js';
 import { Bangumi, Season } from '../../models/dandan-model.js';
 import { initBangumiData, clearBangumiDataCache, getBackgroundDownload, PRUNED_ITEM_FIELDS } from '../../utils/bangumi-data-util.js';
-import { getTmdbJaOriginalTitle, stripSeasonMarker, cleanSearchQuery, smartTitleReplace } from '../../utils/tmdb-util.js';
+import { getTmdbJaOriginalTitle, getTmdbMediaTitleById, stripSeasonMarker, cleanSearchQuery, smartTitleReplace } from '../../utils/tmdb-util.js';
 import { mockJsonResponse, withMockFetch } from '../helpers/context.js';
+
+test('tmdb getTmdbMediaTitleById resolves a TV title for tmdbId-only episode searches', async () => {
+  Globals.init({ LOG_LEVEL: 'error', TMDB_API_KEY: 'tmdb-id-probe' });
+
+  const result = await withMockFetch(async (url) => {
+    assert.match(String(url), /\/3\/tv\/300146\?/);
+    assert.match(String(url), /language=zh-CN/);
+    return mockJsonResponse({
+      id: 300146,
+      name: '嫁金钗',
+      original_name: '嫁金钗',
+    }, String(url));
+  }, () => getTmdbMediaTitleById('300146', 'tv'));
+
+  assert.deepEqual(result, {
+    id: 300146,
+    mediaType: 'tv',
+    title: '嫁金钗',
+    originalTitle: '嫁金钗',
+  });
+});
 
 test('tmdb stripSeasonMarker 剥离季与分部标记', () => {
   assert.strictEqual(stripSeasonMarker('スティール・ボール・ラン ジョジョの奇妙な冒険 1st STAGE'), 'スティール・ボール・ラン ジョジョの奇妙な冒険', '序数 STAGE 标记被剥离');
