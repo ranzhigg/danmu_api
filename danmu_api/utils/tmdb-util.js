@@ -154,13 +154,18 @@ export async function getTmdbMediaTitleById(tmdbId, preferredMediaType = 'tv', o
         ? (detail.original_name || detail.name || '')
         : (detail.original_title || detail.title || '');
 
-      log('info', `[system] [tmdb] 通过 ID 解析标题成功: ${id} (${mediaType}) -> ${title}`);
-      return {
+      const releaseDate = mediaType === 'tv' ? detail.first_air_date : detail.release_date;
+      const yearMatch = String(releaseDate || '').match(/^(\d{4})/);
+      const result = {
         id: Number(detail.id) || Number(id),
         mediaType,
         title,
         originalTitle,
       };
+      if (yearMatch) result.year = Number(yearMatch[1]);
+
+      log('info', `[system] [tmdb] 通过 ID 解析标题成功: ${id} (${mediaType}) -> ${title}`);
+      return result;
     } catch (error) {
       if (error?.name === 'AbortError') throw error;
       log('info', `[system] [tmdb] 解析 ${mediaType}/${id} 失败，尝试其他媒体类型: ${error.message}`);

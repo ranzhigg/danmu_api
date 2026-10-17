@@ -108,6 +108,197 @@ test('searchEpisodes should accept Infuse-style tmdbId-only requests', async () 
     else globalThis.caches = previousCaches;
   }
 });
+
+test('searchEpisodes should treat TMDB movie requests as single-item media across source categories', async () => {
+  const previousCaches = globalThis.caches;
+  const entries = new Map();
+  globalThis.caches = {
+    default: {
+      async put(request, response) { entries.set(request.url, response.clone()); },
+      async match(request) { return entries.get(request.url)?.clone(); },
+    },
+  };
+
+  try {
+    for (const [index, typeDescription] of ['纪录片', '综艺', '动漫'].entries()) {
+      Globals.init({ LOG_LEVEL: 'error' });
+      const animeId = 8100 + index;
+      const detail = {
+        animeId,
+        bangumiId: String(animeId),
+        animeTitle: `单集测试${index}(2026)【${typeDescription}】`,
+        type: typeDescription,
+        typeDescription,
+        imageUrl: '',
+        startDate: '2026-01-01T00:00:00.000Z',
+        source: 'test',
+        links: [{ id: animeId * 10, title: '【测试源】 正片', url: `https://example.com/${animeId}` }],
+      };
+
+      const requestUrl = new URL(`${urlPrefix}/api/v2/search/episodes?tmdbId=${9000 + index}&tmdbIdType=1&episode=1`);
+      const response = await searchEpisodes(
+        requestUrl,
+        async (_searchUrl, _preferAnimeId, _preferSource, detailStore) => {
+          detailStore.set(String(animeId), detail);
+          return new Response(JSON.stringify({
+            success: true,
+            animes: [{
+              animeId,
+              bangumiId: String(animeId),
+              animeTitle: detail.animeTitle,
+              type: typeDescription,
+              typeDescription,
+              source: 'test',
+            }],
+          }), { status: 200, headers: { 'content-type': 'application/json' } });
+        },
+        async () => ({ title: `单集测试${index}`, year: 2026, mediaType: 'movie' }),
+      );
+      const body = await response.json();
+
+      assert.equal(response.status, 200);
+      assert.equal(body.animes.length, 1, `${typeDescription} 应保留单集候选`);
+      assert.equal(body.animes[0].typeDescription, typeDescription);
+      assert.equal(body.animes[0].episodes.length, 1);
+    }
+  } finally {
+    if (previousCaches === undefined) delete globalThis.caches;
+    else globalThis.caches = previousCaches;
+  }
+});
+
+test('searchEpisodes should use direct sources when the configured movie sources only return editorial videos', async () => {
+  Globals.init({ LOG_LEVEL: 'error' });
+  const previousCaches = globalThis.caches;
+  const entries = new Map();
+  globalThis.caches = {
+    default: {
+      async put(request, response) { entries.set(request.url, response.clone()); },
+      async match(request) { return entries.get(request.url)?.clone(); },
+    },
+  };
+
+  try {
+    const calls = [];
+    const noise = {
+      animeId: 8201,
+      bangumiId: '8201',
+      animeTitle: '某电影深度解读(2026)【电影】from 360',
+      type: '电影',
+      typeDescription: '电影',
+      source: '360',
+      links: [{ id: 820101, title: '【youku】 深度解读', url: 'https://example.com/noise' }],
+    };
+    const feature = {
+      animeId: 8202,
+      bangumiId: '8202',
+      animeTitle: '某电影(2026)【电影】from tencent',
+      type: '电影',
+      typeDescription: '电影',
+      source: 'tencent',
+      links: [{ id: 820201, title: '【qq】 正片', url: 'https://example.com/feature' }],
+    };
+    const featureFromYouku = {
+      animeId: 8203,
+      bangumiId: '8203',
+      animeTitle: '某电影(2026)【电影】from youku',
+      type: '电影',
+      typeDescription: '电影',
+      source: 'youku',
+      links: [{ id: 820301, title: '【youku】 正片', url: 'https://example.com/feature-youku' }],
+    };
+
+    const response = await searchEpisodes(
+      new URL(`${urlPrefix}/api/v2/search/episodes?tmdbId=9005&tmdbIdType=1&episode=1`),
+      async (_searchUrl, _preferAnimeId, _preferSource, detailStore, _targetPlatform, _forceRefresh, sourceOrderOverride) => {
+        calls.push(sourceOrderOverride || null);
+        const details = sourceOrderOverride ? [feature, featureFromYouku] : [noise];
+        for (const detail of details) detailStore.set(`${detail.source}:${detail.bangumiId}`, detail);
+        return new Response(JSON.stringify({
+          success: true,
+          animes: details.map(detail => ({ ...detail, links: undefined })),
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      },
+      async () => ({ title: '某电影', year: 2026, mediaType: 'movie' }),
+    );
+    const body = await response.json();
+
+    assert.equal(calls.length, 2, '默认源无正片时应追加一次直连源搜索');
+    assert.deepEqual(calls[0], null);
+    assert.ok(calls[1].includes('tencent'));
+    assert.ok(calls[1].includes('youku'));
+    assert.deepEqual(body.animes.map(anime => anime.animeId), [8202, 8203]);
+    assert.deepEqual(body.animes.map(anime => anime.animeTitle), [feature.animeTitle, featureFromYouku.animeTitle]);
+    assert.equal(body.animes[0].episodes[0].episodeId, 820201);
+    assert.equal(body.animes[1].episodes[0].episodeId, 820301);
+  } finally {
+    if (previousCaches === undefined) delete globalThis.caches;
+    else globalThis.caches = previousCaches;
+  }
+});
+
+test('searchEpisodes should retry direct sources when the first TV candidate lacks the requested episode', async () => {
+  Globals.init({ LOG_LEVEL: 'error' });
+  const previousCaches = globalThis.caches;
+  const entries = new Map();
+  globalThis.caches = {
+    default: {
+      async put(request, response) { entries.set(request.url, response.clone()); },
+      async match(request) { return entries.get(request.url)?.clone(); },
+    },
+  };
+
+  try {
+    const calls = [];
+    const defaultDetail = {
+      animeId: 8301,
+      bangumiId: '8301',
+      animeTitle: '某电视剧(2026)【电视剧】from 360',
+      type: 'tvseries',
+      typeDescription: '电视剧',
+      source: '360',
+      links: [
+        { id: 830101, title: '【360】 第1集', url: 'https://example.com/tv-1' },
+        { id: 830102, title: '【360】 第2集', url: 'https://example.com/tv-2' },
+      ],
+    };
+    const fallbackDetail = {
+      animeId: 8302,
+      bangumiId: '8302',
+      animeTitle: '某电视剧(2026)【电视剧】from tencent',
+      type: 'tvseries',
+      typeDescription: '电视剧',
+      source: 'tencent',
+      links: [
+        { id: 830201, title: '【qq】 第1集', url: 'https://example.com/tv-1' },
+        { id: 830202, title: '【qq】 第2集', url: 'https://example.com/tv-2' },
+        { id: 830203, title: '【qq】 第3集', url: 'https://example.com/tv-3' },
+      ],
+    };
+
+    const response = await searchEpisodes(
+      new URL(`${urlPrefix}/api/v2/search/episodes?anime=%E6%9F%90%E7%94%B5%E8%A7%86%E5%89%A7&episode=3`),
+      async (_searchUrl, _preferAnimeId, _preferSource, detailStore, _targetPlatform, _forceRefresh, sourceOrderOverride) => {
+        calls.push(sourceOrderOverride || null);
+        const detail = sourceOrderOverride ? fallbackDetail : defaultDetail;
+        detailStore.set(`${detail.source}:${detail.bangumiId}`, detail);
+        return new Response(JSON.stringify({
+          success: true,
+          animes: [{ ...detail, links: undefined }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      },
+    );
+    const body = await response.json();
+
+    assert.equal(calls.length, 2, '默认源没有目标集数时应追加一次直连源搜索');
+    assert.deepEqual(body.animes.map(anime => anime.animeId), [8302]);
+    assert.equal(body.animes[0].episodes[0].episodeId, 830203);
+  } finally {
+    if (previousCaches === undefined) delete globalThis.caches;
+    else globalThis.caches = previousCaches;
+  }
+});
+
   // 测试标题解析
 test('PARSE TitleSeasonEpisode', async () => {
     let title, season, episode;

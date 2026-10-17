@@ -22,7 +22,7 @@ import { getTMDBChineseTitle, getTmdbMediaTitleById, getTmdbSeasonBoundaries } f
 import { applyMergeLogic, mergeDanmakuList, MERGE_DELIMITER, alignSourceTimelines, sanitizeUrl } from "../utils/merge-util.js";
 import { getHanjutvSourceLabel } from "../utils/hanjutv-util.js";
 import AIClient from '../utils/ai-util.js';
-import { getSourceByKey, getSourceMetaByKey, getLogNameByKey } from "../sources/registry.js";
+import { getSourceByKey, getSourceMetaByKey, getLogNameByKey, isRegisteredSource } from "../sources/registry.js";
 import { isHongguoPlayerUrl } from "../sources/hongguo.js";
 import BilibiliSource from "../sources/bilibili.js"; // resolveB23Link 为 BilibiliSource 实例方法，单测中仍需直接 new
 import { Anime, AnimeMatch, Episodes, Bangumi } from "../models/dandan-model.js";
@@ -378,9 +378,39 @@ function checkEpisodeSatisfied(animesList, querySeason, queryEpisode, requestAni
  * @param {string|null} preferAnimeId 优选ID
  * @param {string|null} preferSource 优选源
  */
-async function executeSourceHandlers(resultData, queryTitle, targetAnimesList, requestAnimeDetailsMap, targetSeason, preferAnimeId = null, preferSource = null) {
+function resolveSearchSourceOrder(sourceOrderOverride = null) {
+  const configuredOrder = Array.isArray(sourceOrderOverride)
+    ? sourceOrderOverride
+    : globals.sourceOrderArr;
+  const sourceOrder = [...new Set(
+    configuredOrder
+      .map(source => String(source || '').trim())
+      .filter(source => source && isRegisteredSource(source))
+  )];
+
+  return sourceOrder.length > 0 ? sourceOrder : globals.sourceOrderArr;
+}
+
+// 同一个 animeId 可能被不同弹幕源复用。搜索结果需要保留这些跨源候选，
+// 否则 Infuse 只能看到第一个源，无法让用户手动选择更合适的弹幕。
+function getSearchAnimeIdentityKey(anime) {
+  const source = String(anime?.source || '').trim();
+  const id = anime?.animeId ?? anime?.bangumiId ?? '';
+  return `${source}:${String(id)}`;
+}
+
+async function executeSourceHandlers(
+  resultData,
+  queryTitle,
+  targetAnimesList,
+  requestAnimeDetailsMap,
+  targetSeason,
+  preferAnimeId = null,
+  preferSource = null,
+  sourceOrder = globals.sourceOrderArr,
+) {
   // 仅处理resultData中存在数据的源，避免将undefined传入handleAnimes
-  const activeSourceKeys = globals.sourceOrderArr.filter(key => resultData[key] !== undefined);
+  const activeSourceKeys = sourceOrder.filter(key => resultData[key] !== undefined);
   const sourceTasks = [];
 
   for (const key of activeSourceKeys) {
@@ -400,9 +430,9 @@ async function executeSourceHandlers(resultData, queryTitle, targetAnimesList, r
   // 并发执行所有源的handleAnimes
   const results = await Promise.allSettled(sourceTasks.map(task => task.promise));
 
-  // 按SOURCE_ORDER顺序合并各源的独立结果到目标容器
-  // 先处理的源数据优先保留（animeId去重、detailStore键去重）
-  const existingAnimeIds = new Set(targetAnimesList.map(a => a.animeId));
+  // 按 SOURCE_ORDER 顺序合并各源的独立结果到目标容器。
+  // 只在同一源内去重；跨源即使 animeId 相同也必须保留，供客户端选择弹幕源。
+  const existingAnimeIds = new Set(targetAnimesList.map(getSearchAnimeIdentityKey));
 
   for (let i = 0; i < sourceTasks.length; i++) {
     if (results[i].status === 'rejected') {
@@ -412,11 +442,12 @@ async function executeSourceHandlers(resultData, queryTitle, targetAnimesList, r
 
     const { animes: isolatedAnimes, detailStore: isolatedDetailStore } = sourceTasks[i];
 
-    // 合并动漫结果列表（使用 Set 确保 O(1) 检索，优先源先入为主）
+    // 合并动漫结果列表（使用源+animeId 确保 O(1) 检索，保留跨源候选）
     for (const anime of isolatedAnimes) {
-      if (!existingAnimeIds.has(anime.animeId)) {
+      const identityKey = getSearchAnimeIdentityKey(anime);
+      if (!existingAnimeIds.has(identityKey)) {
         targetAnimesList.push(anime);
-        existingAnimeIds.add(anime.animeId);
+        existingAnimeIds.add(identityKey);
       }
     }
 
@@ -432,16 +463,35 @@ async function executeSourceHandlers(resultData, queryTitle, targetAnimesList, r
 }
 
 // Extracted function for GET /api/v2/search/anime
-export async function searchAnime(url, preferAnimeId = null, preferSource = null, detailStore = null, targetPlatform = null, forceRefresh = false) {
+// sourceOrderOverride 仅供需要补查特定源的内部调用使用，不改变默认 SOURCE_ORDER 配置。
+export async function searchAnime(
+  url,
+  preferAnimeId = null,
+  preferSource = null,
+  detailStore = null,
+  targetPlatform = null,
+  forceRefresh = false,
+  sourceOrderOverride = null,
+) {
   // 单次搜索请求内启用 HTTP 响应复用缓存: 作为各源通用的请求级复用安全网, 借助 AsyncLocalStorage 做请求级隔离
   if (httpCacheContext.getStore()) {
-    return searchAnimeBody(url, preferAnimeId, preferSource, detailStore, targetPlatform, forceRefresh);
+    return searchAnimeBody(url, preferAnimeId, preferSource, detailStore, targetPlatform, forceRefresh, sourceOrderOverride);
   }
-  return runWithHttpCache(() => searchAnimeBody(url, preferAnimeId, preferSource, detailStore, targetPlatform, forceRefresh));
+  return runWithHttpCache(() => searchAnimeBody(url, preferAnimeId, preferSource, detailStore, targetPlatform, forceRefresh, sourceOrderOverride));
 }
 
-async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, detailStore = null, targetPlatform = null, forceRefresh = false) {
+async function searchAnimeBody(
+  url,
+  preferAnimeId = null,
+  preferSource = null,
+  detailStore = null,
+  targetPlatform = null,
+  forceRefresh = false,
+  sourceOrderOverride = null,
+) {
   let queryTitle = url.searchParams.get("keyword");
+  const sourceOrder = resolveSearchSourceOrder(sourceOrderOverride);
+  const isScopedSearch = Array.isArray(sourceOrderOverride) && sourceOrderOverride.length > 0;
 
   // 搜索词杂音清理：移除画质/配音/版本等杂音词后再提交源站搜索
   if (globals.titleNoiseFilter) {
@@ -705,14 +755,14 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
 
   try {
     // 根据 sourceOrderArr 动态构建逐源管道：每个源形成独立的 search → handleAnimes 流水线
-    log("info", `[system] [LogVar-API] Search sourceOrderArr: ${globals.sourceOrderArr}`);
+    log("info", `[system] [LogVar-API] Search sourceOrderArr: ${sourceOrder}`);
 
     // 存储各源搜索结果的容器，供S2+季度扩展逻辑读取
     const resultData = {};
 
     // 源Key到对应搜索Promise的映射：统一从注册表查实例与日志标签，新增源无需改此处分发
     const sourceSearchMap = {};
-    for (const source of globals.sourceOrderArr) {
+    for (const source of sourceOrder) {
       const meta = getSourceMetaByKey(source);
       if (!meta) {
         log("warn", `[system] [LogVar-API] 未注册的源键 "${source}"，已跳过`);
@@ -724,12 +774,12 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
 
     // 构建逐源管道：每个源 search 完成后，通过 executeSourceHandlers 处理 handleAnimes
     // 传入仅含当前源数据的 resultData，使 executeSourceHandlers 仅处理该源
-    const pipelineTasks = globals.sourceOrderArr.map(source => {
+    const pipelineTasks = sourceOrder.map(source => {
       const isolatedAnimes = [];
       const isolatedDetailStore = new Map();
       const pipelinePromise = sourceSearchMap[source].then(async searchResult => {
         resultData[source] = searchResult;
-        await executeSourceHandlers({ [source]: searchResult }, queryTitle, isolatedAnimes, isolatedDetailStore, querySeason, preferAnimeId, preferSource);
+        await executeSourceHandlers({ [source]: searchResult }, queryTitle, isolatedAnimes, isolatedDetailStore, querySeason, preferAnimeId, preferSource, sourceOrder);
       });
       return { key: source, animes: isolatedAnimes, detailStore: isolatedDetailStore, promise: pipelinePromise };
     });
@@ -737,9 +787,9 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
     // 并发执行所有逐源管道，每个管道内部 search 完成后立即衔接 handleAnimes
     const pipelineResults = await Promise.allSettled(pipelineTasks.map(task => task.promise));
 
-    // 按SOURCE_ORDER顺序合并各管道的独立结果到目标容器
-    // 先处理的源数据优先保留（animeId去重、detailStore键去重）
-    const existingAnimeIds = new Set(curAnimes.map(a => a.animeId));
+    // 按 SOURCE_ORDER 顺序合并各管道的独立结果到目标容器。
+    // 跨源同 ID 是合法场景，不能因为优先源先返回就吞掉其它候选。
+    const existingAnimeIds = new Set(curAnimes.map(getSearchAnimeIdentityKey));
 
     for (let i = 0; i < pipelineTasks.length; i++) {
       if (pipelineResults[i].status === 'rejected') {
@@ -749,11 +799,12 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
 
       const { animes: isolatedAnimes, detailStore: isolatedDetailStore } = pipelineTasks[i];
 
-      // 合并动漫结果列表（使用 Set 确保 O(1) 检索，优先源先入为主）
+      // 合并动漫结果列表（使用源+animeId 保留所有源）
       for (const anime of isolatedAnimes) {
-        if (!existingAnimeIds.has(anime.animeId)) {
+        const identityKey = getSearchAnimeIdentityKey(anime);
+        if (!existingAnimeIds.has(identityKey)) {
           curAnimes.push(anime);
-          existingAnimeIds.add(anime.animeId);
+          existingAnimeIds.add(identityKey);
         }
       }
 
@@ -768,7 +819,7 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
     }
 
     // 缓存首季/默认请求结果，剥离附加链接
-    if (curAnimes.length > 0) {
+    if (curAnimes.length > 0 && !isScopedSearch) {
       setSearchCache(cacheKey, curAnimes.map(({ links, ...pureAnime }) => pureAnime), requestAnimeDetailsMap);
     }
 
@@ -779,7 +830,7 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
     // 若未包含且用户指定了季度，推导最大季并扩展至后续季以辅助跨季匹配
     if (!isEpisodeSatisfied && querySeason !== null) {
       let maxSeason = querySeason;
-      for (const source of globals.sourceOrderArr) {
+      for (const source of sourceOrder) {
         const rawAnimes = resultData[source];
         if (Array.isArray(rawAnimes)) {
           for (const item of rawAnimes) {
@@ -817,7 +868,7 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
         const expansionEnd = targetSeasons.length > 0 ? Math.max(...targetSeasons) : maxSeason;
 
         const expandPromises = [];
-        for (const source of globals.sourceOrderArr) {
+        for (const source of sourceOrder) {
           if (!resultData[source]) continue;
           // 在PLATFORM_ORDER模式下，跳过已满足平台的对应源；unsatisfied为空时不跳过
           if (targetPlatform && unsatisfiedPlatforms.size > 0 && !unsatisfiedPlatforms.has(source)) continue;
@@ -826,8 +877,8 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
             const sourceResults = [];
             for (let s = expansionStart; s <= expansionEnd; s++) {
               const seasonAnimes = [];
-              await executeSourceHandlers({ [source]: resultData[source] }, queryTitle, seasonAnimes, requestAnimeDetailsMap, s, preferAnimeId, preferSource);
-              if (seasonAnimes.length > 0) {
+              await executeSourceHandlers({ [source]: resultData[source] }, queryTitle, seasonAnimes, requestAnimeDetailsMap, s, preferAnimeId, preferSource, sourceOrder);
+              if (seasonAnimes.length > 0 && !isScopedSearch) {
                 setSearchCache(`${queryTitle}_S${s}`, seasonAnimes.map(({ links, ...pureAnime }) => pureAnime), requestAnimeDetailsMap);
               }
               sourceResults.push(seasonAnimes);
@@ -911,7 +962,7 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
     const responseAnimes = curAnimes.map(({ links, ...pureAnime }) => pureAnime);
 
     // 缓存搜索结果
-    if (responseAnimes.length > 0) {
+    if (responseAnimes.length > 0 && !isScopedSearch) {
       const cacheKey = querySeason !== null ? `${queryTitle}_S${querySeason}` : queryTitle;
       setSearchCache(cacheKey, responseAnimes, requestAnimeDetailsMap);
     }
@@ -2106,12 +2157,95 @@ function resolveTmdbMediaType(url, episode) {
   return String(episode || '').toLowerCase() === 'movie' ? 'movie' : 'tv';
 }
 
+// 单集媒体在 Infuse/弹弹play兼容请求中通常仍携带 episode=1，不能只靠 episode=movie 判断。
+// 直连源只在默认聚合结果没有合格单集媒体时补查，避免改变用户配置的常规源顺序和电视剧请求开销。
+const DIRECT_FALLBACK_SOURCE_ORDER = Object.freeze([
+  'tencent',
+  'youku',
+  'iqiyi',
+  'imgo',
+  'bilibili',
+  'migu',
+]);
+
+function resolveMissingDirectFallbackSources() {
+  const configuredSources = new Set(resolveSearchSourceOrder());
+  return DIRECT_FALLBACK_SOURCE_ORDER.filter(source => !configuredSources.has(source));
+}
+
+const FEATURE_EDITORIAL_MARKERS = Object.freeze([
+  '预告',
+  '预览',
+  '先导',
+  '花絮',
+  '彩蛋',
+  '幕后',
+  '专访',
+  '采访',
+  '解说',
+  '深度解读',
+  '影评',
+  '解析',
+  '盘点',
+  '混剪',
+  '回顾',
+  '速看',
+  'reaction',
+  'trailer',
+  'making of',
+  'behind the scenes',
+]);
+
+function isFeatureRequest(url, episode) {
+  return resolveTmdbMediaType(url, episode) === 'movie'
+    || String(episode || '').toLowerCase() === 'movie';
+}
+
+function isEditorialTitle(value) {
+  const text = String(value || '').toLowerCase();
+  return FEATURE_EDITORIAL_MARKERS.some(marker => text.includes(marker));
+}
+
+function isFeatureCandidate(animeItem, requestedYear = null) {
+  const typeText = `${animeItem?.type || ''} ${animeItem?.typeDescription || ''} ${animeItem?.animeTitle || ''}`;
+  // TMDB 的 movie 可能被视频源标记为纪录片、综艺、动漫或演唱会，不能只认“电影”。
+  if (!/电影|纪录片|综艺|动漫|动画|演唱会|短片|音乐|movie|documentary|variety|anime|animation|concert|short/i.test(typeText)) return false;
+  if (/电视剧|剧集|tvseries|series/i.test(typeText) && !/电影|movie/i.test(typeText)) return false;
+  if (isEditorialTitle(animeItem?.animeTitle)) return false;
+
+  const candidateYear = extractYear(String(animeItem?.animeTitle || ''));
+  return !requestedYear || !candidateYear || candidateYear === requestedYear;
+}
+
+function mergeEpisodeSearchResults(...responses) {
+  const animes = [];
+  const seen = new Set();
+
+  for (const response of responses) {
+    for (const anime of response?.animes || []) {
+      const key = [anime?.source || '', anime?.bangumiId || anime?.animeId || '', anime?.animeTitle || ''].join('|');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      animes.push(anime);
+    }
+  }
+
+  return {
+    ...(responses.find(response => response && typeof response === 'object') || {}),
+    success: responses.some(response => response?.success === true),
+    errorMessage: '',
+    animes,
+  };
+}
+
 // Extracted function for GET /api/v2/search/episodes
 // searchAnimeFn/tmdbTitleResolver 仅用于离线回归测试，不改变线上调用方式。
 export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitleResolver = getTmdbMediaTitleById) {
   let anime = url.searchParams.get("anime") || "";
   const tmdbId = normalizeTmdbId(url.searchParams.get('tmdbId'));
   const episode = url.searchParams.get("episode") || "";
+  const featureRequest = isFeatureRequest(url, episode);
+  let requestedYear = null;
 
   // 弹弹play规范允许只传 tmdbId。Infuse 的请求正是这种形式，
   // 先通过 TMDB 详情拿到可搜索标题，再复用现有的多平台搜索与集数过滤逻辑。
@@ -2119,6 +2253,7 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
     const mediaType = resolveTmdbMediaType(url, episode);
     const tmdbMedia = await tmdbTitleResolver(tmdbId, mediaType);
     anime = tmdbMedia?.title || '';
+    requestedYear = Number.isInteger(tmdbMedia?.year) ? tmdbMedia.year : null;
     if (anime) {
       log("info", `[system] [episodes] Resolved anime title from tmdbId ${tmdbId}: ${anime}`);
     }
@@ -2151,7 +2286,41 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
   const requestAnimeDetailsMap = new Map();
 
   const searchRes = await searchAnimeFn(searchUrl, null, null, requestAnimeDetailsMap);
-  const searchData = await searchRes.json();
+  let searchData = await searchRes.json();
+
+  // 豆瓣未收录或未返回平台关联时，默认源可能只给出 360 的解说/专访条目。
+  // 单集媒体端点补查未配置的直连视频源，并合并所有候选，让 Infuse 可以手动选源。
+  // sourceOrderOverride 不会改写全局配置；电视剧先走默认源，只有没有目标集数时才补查直连源。
+  const fallbackSourceOrder = resolveMissingDirectFallbackSources();
+  const needsFeatureFallback = featureRequest
+    && fallbackSourceOrder.length > 0;
+  const needsEmptyResultFallback = !featureRequest
+    && fallbackSourceOrder.length > 0
+    && (!searchData?.success || !Array.isArray(searchData?.animes) || searchData.animes.length === 0);
+  let fallbackAttempted = false;
+  const searchDirectFallback = async () => {
+    if (fallbackAttempted || fallbackSourceOrder.length === 0) return;
+    fallbackAttempted = true;
+    try {
+      const fallbackRes = await searchAnimeFn(
+        searchUrl,
+        null,
+        null,
+        requestAnimeDetailsMap,
+        null,
+        true,
+        fallbackSourceOrder,
+      );
+      const fallbackData = await fallbackRes.json();
+      searchData = mergeEpisodeSearchResults(searchData, fallbackData);
+      log("info", `[system] [episodes] Direct fallback sources returned ${(fallbackData?.animes || []).length} candidates`);
+    } catch (error) {
+      log("warn", `[system] [episodes] Direct fallback source search failed: ${error.message}`);
+    }
+  };
+  if (needsFeatureFallback || needsEmptyResultFallback) {
+    await searchDirectFallback();
+  }
 
   if (!searchData.success || !searchData.animes || searchData.animes.length === 0) {
     log("info", "[system] [episodes] No anime found for the given title");
@@ -2165,61 +2334,71 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
     });
   }
 
-  let resultAnimes = [];
+  const collectEpisodeResults = async candidateData => {
+    const results = [];
 
-  // 遍历所有找到的动漫，获取它们的集数信息
-  for (const animeItem of searchData.animes) {
-    const detailAnime =
-      resolveAnimeById(animeItem.bangumiId, requestAnimeDetailsMap, animeItem.source) ||
-      resolveAnimeById(animeItem.animeId, requestAnimeDetailsMap, animeItem.source);
+    // 遍历所有找到的动漫，获取它们的集数信息
+    for (const animeItem of candidateData?.animes || []) {
+      if (featureRequest && !isFeatureCandidate(animeItem, requestedYear)) continue;
 
-    let bangumiData = null;
-    if (detailAnime) {
-      bangumiData = buildBangumiData(detailAnime, animeItem.bangumiId);
-    } else {
-      const bangumiUrl = new URL(`/bangumi/${animeItem.bangumiId}`, url.origin);
-      const bangumiRes = await getBangumi(bangumiUrl.pathname);
-      bangumiData = await bangumiRes.json();
-    }
+      const detailAnime =
+        resolveAnimeById(animeItem.bangumiId, requestAnimeDetailsMap, animeItem.source) ||
+        resolveAnimeById(animeItem.animeId, requestAnimeDetailsMap, animeItem.source);
 
-    if (bangumiData.success && bangumiData.bangumi && bangumiData.bangumi.episodes) {
-      let filteredEpisodes = bangumiData.bangumi.episodes;
+      let bangumiData = null;
+      if (detailAnime) {
+        bangumiData = buildBangumiData(detailAnime, animeItem.bangumiId);
+      } else {
+        const bangumiUrl = new URL(`/bangumi/${animeItem.bangumiId}`, url.origin);
+        const bangumiRes = await getBangumi(bangumiUrl.pathname);
+        bangumiData = await bangumiRes.json();
+      }
 
-      // 根据 episode 参数过滤集数
-      if (episode) {
-        if (episode === "movie") {
-          // 仅保留剧场版结果
+      if (bangumiData.success && bangumiData.bangumi && bangumiData.bangumi.episodes) {
+        let filteredEpisodes = bangumiData.bangumi.episodes;
+
+        // 根据 episode 参数过滤集数
+        if (featureRequest) {
+          // 单集媒体请求即使携带 episode=1 也只有一部作品；同时去掉聚合源的解说/幕后条目。
           filteredEpisodes = bangumiData.bangumi.episodes.filter(ep =>
-            animeItem.typeDescription && (
-              animeItem.typeDescription.includes("电影") ||
-              animeItem.typeDescription.includes("剧场版") ||
-              ep.episodeTitle.toLowerCase().includes("movie") ||
-              ep.episodeTitle.includes("剧场版")
-            )
+            !isEditorialTitle(`${animeItem.animeTitle} ${ep.episodeTitle}`)
           );
         } else if (/^\d+$/.test(episode)) {
-          // 纯数字，仅保留指定集数
+          // 电视剧/动漫的纯数字请求，仅保留指定集数
           const targetEpisode = parseInt(episode);
           filteredEpisodes = bangumiData.bangumi.episodes.filter(ep =>
             parseInt(ep.episodeNumber) === targetEpisode
           );
         }
-      }
 
-      // 只有当过滤后还有集数时才添加到结果中
-      if (filteredEpisodes.length > 0) {
-        resultAnimes.push(Episodes.fromJson({
-          animeId: animeItem.animeId,
-          animeTitle: animeItem.animeTitle,
-          type: animeItem.type,
-          typeDescription: animeItem.typeDescription,
-          episodes: filteredEpisodes.map(ep => ({
-            episodeId: ep.episodeId,
-            episodeTitle: ep.episodeTitle,
-            url: ep.url || ""
-          }))
-        }));
+        // 只有当过滤后还有集数时才添加到结果中
+        if (filteredEpisodes.length > 0) {
+          results.push(Episodes.fromJson({
+            animeId: animeItem.animeId,
+            animeTitle: animeItem.animeTitle,
+            type: animeItem.type,
+            typeDescription: animeItem.typeDescription,
+            episodes: filteredEpisodes.map(ep => ({
+              episodeId: ep.episodeId,
+              episodeTitle: ep.episodeTitle,
+              url: ep.url || ""
+            }))
+          }));
+        }
       }
+    }
+
+    return results;
+  };
+
+  let resultAnimes = await collectEpisodeResults(searchData);
+
+  // 默认源可能返回了剧名，但没有请求集数（常见于新剧、跨平台集数不同、
+  // 或 TMDB 中文名与源站标题略有差异）。只有此时再补查直连源，避免每次播放都放大请求量。
+  if (!featureRequest && /^\d+$/.test(episode) && resultAnimes.length === 0) {
+    await searchDirectFallback();
+    if (searchData?.animes?.length > 0) {
+      resultAnimes = await collectEpisodeResults(searchData);
     }
   }
 
