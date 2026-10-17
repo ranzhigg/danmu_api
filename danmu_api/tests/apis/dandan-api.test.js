@@ -299,6 +299,110 @@ test('searchEpisodes should retry direct sources when the first TV candidate lac
   }
 });
 
+test('searchEpisodes should use explicit TV episode numbers and ignore editorial entries', async () => {
+  Globals.init({ LOG_LEVEL: 'error' });
+  const previousCaches = globalThis.caches;
+  const entries = new Map();
+  globalThis.caches = {
+    default: {
+      async put(request, response) { entries.set(request.url, response.clone()); },
+      async match(request) { return entries.get(request.url)?.clone(); },
+    },
+  };
+
+  try {
+    const detail = {
+      animeId: 8401,
+      bangumiId: '8401',
+      animeTitle: '集数错序测试(2026)【电视剧】from tencent',
+      type: 'tvseries',
+      typeDescription: '电视剧',
+      source: 'tencent',
+      links: [
+        { id: 840101, title: '【qq】 预告', url: 'https://example.com/trailer' },
+        { id: 840102, title: '【qq】 第2集', url: 'https://example.com/episode-2' },
+        { id: 840103, title: '【qq】 第1集', url: 'https://example.com/episode-1' },
+      ],
+    };
+
+    const response = await searchEpisodes(
+      new URL(`${urlPrefix}/api/v2/search/episodes?anime=%E9%9B%86%E6%95%B0%E9%94%99%E5%BA%8F%E6%B5%8B%E8%AF%95&episode=1`),
+      async (_searchUrl, _preferAnimeId, _preferSource, detailStore) => {
+        detailStore.set(`${detail.source}:${detail.bangumiId}`, detail);
+        return new Response(JSON.stringify({
+          success: true,
+          animes: [{ ...detail, links: undefined }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      },
+    );
+    const body = await response.json();
+
+    assert.equal(body.animes.length, 1);
+    assert.equal(body.animes[0].episodes.length, 1);
+    assert.equal(body.animes[0].episodes[0].episodeId, 840103);
+  } finally {
+    if (previousCaches === undefined) delete globalThis.caches;
+    else globalThis.caches = previousCaches;
+  }
+});
+
+test('searchEpisodes should retry the TMDB original title when the localized TV title has no result', async () => {
+  Globals.init({ LOG_LEVEL: 'error' });
+  const previousCaches = globalThis.caches;
+  const entries = new Map();
+  globalThis.caches = {
+    default: {
+      async put(request, response) { entries.set(request.url, response.clone()); },
+      async match(request) { return entries.get(request.url)?.clone(); },
+    },
+  };
+
+  try {
+    const calls = [];
+    const detail = {
+      animeId: 8501,
+      bangumiId: '8501',
+      animeTitle: 'Original Series(2026)【电视剧】from youku',
+      type: 'tvseries',
+      typeDescription: '电视剧',
+      source: 'youku',
+      links: [{ id: 850101, title: '【youku】 第1集', url: 'https://example.com/original-1' }],
+    };
+
+    const response = await searchEpisodes(
+      new URL(`${urlPrefix}/api/v2/search/episodes?tmdbId=9010&tmdbIdType=0&episode=1`),
+      async (searchUrl, _preferAnimeId, _preferSource, detailStore, _targetPlatform, _forceRefresh, sourceOrderOverride) => {
+        calls.push({ keyword: searchUrl.searchParams.get('keyword'), sourceOrderOverride });
+        if (searchUrl.searchParams.get('keyword') !== 'Original Series') {
+          return new Response(JSON.stringify({ success: true, animes: [] }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        detailStore.set(`${detail.source}:${detail.bangumiId}`, detail);
+        return new Response(JSON.stringify({
+          success: true,
+          animes: [{ ...detail, links: undefined }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      },
+      async () => ({
+        title: '本地译名',
+        originalTitle: 'Original Series',
+        year: 2026,
+        mediaType: 'tv',
+      }),
+    );
+    const body = await response.json();
+
+    assert.equal(body.animes.length, 1);
+    assert.equal(body.animes[0].episodes[0].episodeId, 850101);
+    assert.deepEqual(calls.slice(0, 2).map(call => call.keyword), ['本地译名', 'Original Series']);
+  } finally {
+    if (previousCaches === undefined) delete globalThis.caches;
+    else globalThis.caches = previousCaches;
+  }
+});
+
   // 测试标题解析
 test('PARSE TitleSeasonEpisode', async () => {
     let title, season, episode;
