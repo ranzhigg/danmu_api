@@ -44,7 +44,6 @@ export const Globals = {
   commentCache: new Map(), // 弹幕缓存，存储格式：{ videoUrl: { comments, timestamp } }
   favoriteCache: new Map(), // 收藏剧集永久缓存，存储格式：{ keyword: { results, details, timestamp } }，无 TTL、无数量上限
   deployPlatform: '', // 部署平台配置
-  tencentBatchService: null, // Cloudflare ctx.exports 腾讯弹幕分片回环入口
   currentToken: '', // 标识当前可用token
 
   /**
