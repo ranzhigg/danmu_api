@@ -139,10 +139,88 @@ test('tencent 普通弹幕流程不请求 getinfo', async () => {
   const comments = await withMockFetch(fetchImpl, () => source.getEpisodeDanmu(PLAYER_URL));
 
   assert.deepEqual(comments, []);
-  assert.equal(calls.page, 1);
+  assert.equal(calls.page, 0);
   assert.equal(calls.base, 1);
   assert.equal(calls.segment, 1);
   assert.equal(calls.getinfo, 0);
+});
+
+test('tencent 普通环境限制为 6 路并发且不丢分片', async () => {
+  const source = new TencentSource();
+  const segments = Array.from({ length: 15 }, (_, index) => ({
+    type: 'qq',
+    url: `https://dm.video.qq.com/barrage/segment/${VID}/t/v1/${index * 30000}/${(index + 1) * 30000}`,
+  }));
+  source.getEpisodeDanmuSegments = async () => ({ segmentList: segments });
+  Globals.init({});
+  Globals.deployPlatform = 'node';
+
+  let active = 0;
+  let maxActive = 0;
+  const comments = await withMockFetch(async input => {
+    active++;
+    maxActive = Math.max(maxActive, active);
+    await new Promise(resolve => setTimeout(resolve, 2));
+    active--;
+    return mockResponse({ barrage_list: [{ content: String(input) }] });
+  }, () => source.getEpisodeDanmu(PLAYER_URL));
+
+  assert.equal(comments.length, segments.length);
+  assert.ok(maxActive <= 6, `最大并发应不超过 6，实际为 ${maxActive}`);
+  assert.deepEqual(comments.map(item => item.content), segments.map(item => item.url));
+});
+
+test('tencent Cloudflare 长视频通过回环入口按 40 段拆分', async () => {
+  const source = new TencentSource();
+  const segments = Array.from({ length: 85 }, (_, index) => ({
+    type: 'qq',
+    url: `https://dm.video.qq.com/barrage/segment/${VID}/t/v1/${index * 30000}/${(index + 1) * 30000}`,
+  }));
+  source.getEpisodeDanmuSegments = async () => ({ segmentList: segments });
+  Globals.init({});
+  Globals.deployPlatform = 'cloudflare';
+
+  const batchSizes = [];
+  Globals.tencentBatchService = {
+    async fetch(request) {
+      const body = await request.json();
+      batchSizes.push(body.segments.length);
+      return Response.json({
+        success: true,
+        comments: body.segments.map(segment => ({ content: segment.url })),
+      });
+    },
+  };
+
+  const comments = await withMockFetch(
+    async input => { throw new Error(`长视频不应由父调用直连分片: ${input}`); },
+    () => source.getEpisodeDanmu(PLAYER_URL),
+  );
+
+  assert.deepEqual(batchSizes, [40, 40, 5]);
+  assert.equal(comments.length, 85);
+  assert.deepEqual(comments.map(item => item.content), segments.map(item => item.url));
+});
+
+test('tencent Cloudflare 回环入口连续失败时拒绝返回残缺弹幕', async () => {
+  const source = new TencentSource();
+  const segments = Array.from({ length: 41 }, (_, index) => ({
+    type: 'qq',
+    url: `https://dm.video.qq.com/barrage/segment/${VID}/t/v1/${index * 30000}/${(index + 1) * 30000}`,
+  }));
+  source.getEpisodeDanmuSegments = async () => ({ segmentList: segments });
+  Globals.init({});
+  Globals.deployPlatform = 'cloudflare';
+  let calls = 0;
+  Globals.tencentBatchService = {
+    async fetch() {
+      calls++;
+      return Response.json({ success: false, error: 'temporary failure' }, { status: 502 });
+    },
+  };
+
+  await assert.rejects(() => source.getEpisodeDanmu(PLAYER_URL), /temporary failure/);
+  assert.equal(calls, 4, '两个批次各重试一次，任一失败都不能返回部分结果');
 });
 
 test('tencent 分片接口按需请求时长，includeDuration=false 时跳过', async () => {

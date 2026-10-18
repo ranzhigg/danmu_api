@@ -7,6 +7,11 @@ import { generateValidStartDate } from "../utils/time-util.js";
 import { addAnime, removeEarliestAnime } from "../utils/cache-util.js";
 import { printFirst200Chars, titleMatches, getExplicitSeasonNumber, extractSeasonNumberFromAnimeTitle } from "../utils/common-util.js";
 import { SegmentListResponse } from '../models/dandan-model.js';
+import {
+  mapWithConcurrency,
+  TENCENT_SEGMENT_BATCH_SIZE,
+  TENCENT_SEGMENT_CONCURRENCY,
+} from '../utils/tencent-segment-util.js';
 
 // =====================
 // 获取腾讯视频弹幕
@@ -730,25 +735,6 @@ export default class TencentSource extends BaseSource {
 
     log("info", `[tencent] vid: ${vid}`);
 
-    // 获取页面标题
-    let res;
-    try {
-      res = await httpGet(id, {
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        },
-      });
-    } catch (error) {
-      log("error", "[tencent] 请求页面失败:", error);
-      return [];
-    }
-
-    // 使用正则表达式提取 <title> 标签内容
-    const titleMatch = res.data.match(/<title[^>]*>(.*?)<\/title>/i);
-    const title = titleMatch ? titleMatch[1].split("_")[0] : "未知标题";
-    log("info", `[tencent] 标题: ${title}`);
-
     // 普通弹幕流程只需要分片列表，不请求仅用于时长展示的 getinfo
     const segmentResult = await this.getEpisodeDanmuSegments(id, false);
     if (!segmentResult || !segmentResult.segmentList || segmentResult.segmentList.length === 0) {
@@ -758,47 +744,67 @@ export default class TencentSource extends BaseSource {
     const segmentList = segmentResult.segmentList;
     log("info", `[tencent] 弹幕分段数量: ${segmentList.length}`);
 
-    // 创建请求Promise数组
-    const promises = [];
-    for (const segment of segmentList) {
-      promises.push(
-        httpGet(segment.url, {
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-          },
-          retries: 1,
-        })
+    let contents;
+    const shouldSplitCloudflareRequest = globals.deployPlatform === 'cloudflare'
+      && segmentList.length > TENCENT_SEGMENT_BATCH_SIZE;
+
+    if (shouldSplitCloudflareRequest) {
+      if (!globals.tencentBatchService?.fetch) {
+        throw new Error('Tencent batch entrypoint is unavailable on Cloudflare');
+      }
+
+      const batches = [];
+      for (let index = 0; index < segmentList.length; index += TENCENT_SEGMENT_BATCH_SIZE) {
+        batches.push(segmentList.slice(index, index + TENCENT_SEGMENT_BATCH_SIZE));
+      }
+      const results = await Promise.all(batches.map(batch => this.fetchSegmentBatch(batch)));
+      contents = results.flat();
+    } else {
+      const results = await mapWithConcurrency(
+        segmentList,
+        TENCENT_SEGMENT_CONCURRENCY,
+        segment => this.fetchEpisodeSegmentStrict(segment),
       );
-    }
-
-    // 解析弹幕数据
-    let contents = [];
-    try {
-      const results = await Promise.allSettled(promises);
-      const datas = results
-        .filter(result => result.status === "fulfilled")
-        .map(result => {
-          // 检查result是否包含响应数据
-          if (result.value && result.value.data) {
-            return result.value.data;
-          }
-          return null;
-        })
-        .filter(data => data !== null); // 过滤掉null值
-
-      datas.forEach(data => {
-        data = typeof data === "string" ? JSON.parse(data) : data;
-        contents.push(...data.barrage_list);
-      });
-    } catch (error) {
-      log("error", "[tencent] 解析弹幕数据失败:", error);
-      return [];
+      contents = results.flat();
     }
 
     printFirst200Chars(contents);
 
     return contents;
+  }
+
+  async fetchSegmentBatch(segments) {
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await globals.tencentBatchService.fetch(new Request('https://tencent-batch.internal/segments', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ segments }),
+        }));
+        const payload = await response.json();
+        if (!response.ok || payload?.success !== true || !Array.isArray(payload.comments)) {
+          throw new Error(payload?.error || `Tencent batch HTTP ${response.status}`);
+        }
+        return payload.comments;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error('Tencent segment batch failed');
+  }
+
+  async fetchEpisodeSegmentStrict(segment) {
+    const response = await httpGet(segment.url, {
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+      retries: 1,
+    });
+    const data = typeof response?.data === 'string' ? JSON.parse(response.data) : response?.data;
+    if (!Array.isArray(data?.barrage_list)) throw new Error('Malformed Tencent segment payload');
+    return data.barrage_list;
   }
 
   /**
@@ -922,22 +928,7 @@ export default class TencentSource extends BaseSource {
 
   async getEpisodeSegmentDanmu(segment) {
     try {
-      const response = await httpGet(segment.url, {
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        },
-        retries: 1,
-      });
-
-      // 处理响应数据并返回 contents 格式的弹幕
-      let contents = [];
-      if (response && response.data) {
-        const parsedData = typeof response.data === "string" ? JSON.parse(response.data) : response.data;
-        contents.push(...parsedData.barrage_list);
-      }
-
-      return contents;
+      return await this.fetchEpisodeSegmentStrict(segment);
     } catch (error) {
       log("error", "[tencent] 请求分片弹幕失败:", error);
       return []; // 返回空数组而不是抛出错误，保持与getEpisodeDanmu一致的行为
