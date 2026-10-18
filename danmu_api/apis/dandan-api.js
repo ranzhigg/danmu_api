@@ -18,6 +18,12 @@ import {
   extractYear, titleMatches, extractAnimeInfo, extractEpisodeNumberFromTitle, extractSeasonNumberFromAnimeTitle, extractAnimeTitle
 } from "../utils/common-util.js";
 import { getTMDBChineseTitle, getTmdbMediaTitleById, getTmdbSeasonBoundaries } from "../utils/tmdb-util.js";
+import {
+  assignInfuseEpisodeIds,
+  decodeInfuseEpisodeId,
+  getInfuseEpisodeMapping,
+  rememberInfuseEpisodeMapping,
+} from "../utils/infuse-util.js";
 import { applyMergeLogic, mergeDanmakuList, MERGE_DELIMITER, alignSourceTimelines, sanitizeUrl } from "../utils/merge-util.js";
 import { getHanjutvSourceLabel } from "../utils/hanjutv-util.js";
 import AIClient from '../utils/ai-util.js';
@@ -547,7 +553,7 @@ async function searchAnimeBody(
   const cacheKey = querySeason !== null ? `${queryTitle}_S${querySeason}` : queryTitle;
 
   // 收藏缓存命中后必须直接返回，不能因目标集数判断继续请求外部源。
-  if (!forceRefresh && resolveFavoriteForSearchKeyword(cacheKey)) {
+  if (!isScopedSearch && !forceRefresh && resolveFavoriteForSearchKeyword(cacheKey)) {
     const favoriteResults = getSearchCache(cacheKey, requestAnimeDetailsMap) || [];
     return jsonResponse({
       errorCode: 0,
@@ -558,10 +564,12 @@ async function searchAnimeBody(
   }
 
   // 检查普通搜索缓存；刷新收藏时显式跳过所有缓存。
-  let cachedResults = forceRefresh ? null : getSearchCache(cacheKey, requestAnimeDetailsMap);
+  let cachedResults = (forceRefresh || isScopedSearch)
+    ? null
+    : getSearchCache(cacheKey, requestAnimeDetailsMap);
 
   // 如果带季度的特定缓存未命中，尝试获取不带季度的通用搜索缓存
-  if (cachedResults === null && querySeason !== null) {
+  if (!isScopedSearch && cachedResults === null && querySeason !== null) {
     const genericCachedResults = getSearchCache(queryTitle, requestAnimeDetailsMap);
     if (genericCachedResults !== null) {
       log("info", `[system] [searchAnime] Cache miss for ${cacheKey}, fallback to generic cache for ${queryTitle}`);
@@ -2306,18 +2314,26 @@ function mergeEpisodeSearchResults(...responses) {
 
 // Extracted function for GET /api/v2/search/episodes
 // searchAnimeFn/tmdbTitleResolver 仅用于离线回归测试，不改变线上调用方式。
-export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitleResolver = getTmdbMediaTitleById) {
+export async function searchEpisodes(
+  url,
+  searchAnimeFn = searchAnime,
+  tmdbTitleResolver = getTmdbMediaTitleById,
+  options = {},
+) {
   let anime = url.searchParams.get("anime") || "";
   const tmdbId = normalizeTmdbId(url.searchParams.get('tmdbId'));
   const episode = url.searchParams.get("episode") || "";
+  const mediaType = resolveTmdbMediaType(url, episode);
   const featureRequest = isFeatureRequest(url, episode);
+  const sourceOrderOverride = Array.isArray(options?.sourceOrderOverride)
+    ? options.sourceOrderOverride
+    : null;
   let requestedYear = null;
   let tmdbTitleCandidates = [];
 
   // 弹弹play规范允许只传 tmdbId。Infuse 的请求正是这种形式，
   // 先通过 TMDB 详情拿到可搜索标题，再复用现有的多平台搜索与集数过滤逻辑。
   if (!anime && tmdbId) {
-    const mediaType = resolveTmdbMediaType(url, episode);
     const tmdbMedia = await tmdbTitleResolver(tmdbId, mediaType);
     anime = tmdbMedia?.title || '';
     tmdbTitleCandidates = [tmdbMedia?.title, tmdbMedia?.originalTitle]
@@ -2363,7 +2379,15 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
   searchUrl.searchParams.set('episodeLookup', '1');
   const requestAnimeDetailsMap = new Map();
 
-  const searchRes = await searchAnimeFn(searchUrl, null, null, requestAnimeDetailsMap);
+  const searchRes = await searchAnimeFn(
+    searchUrl,
+    null,
+    null,
+    requestAnimeDetailsMap,
+    null,
+    false,
+    sourceOrderOverride,
+  );
   let searchData = await searchRes.json();
 
   // TMDB 的中文标题不一定是源站使用的标题；影视剧尤其常见英文原名、繁体名或
@@ -2377,7 +2401,15 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
       try {
         const aliasUrl = buildSearchAnimeUrl(url, aliasTitle);
         aliasUrl.searchParams.set('episodeLookup', '1');
-        const aliasRes = await searchAnimeFn(aliasUrl, null, null, requestAnimeDetailsMap);
+        const aliasRes = await searchAnimeFn(
+          aliasUrl,
+          null,
+          null,
+          requestAnimeDetailsMap,
+          null,
+          false,
+          sourceOrderOverride,
+        );
         const aliasData = await aliasRes.json();
         searchData = mergeEpisodeSearchResults(searchData, aliasData);
         log("info", `[system] [episodes] TMDB alias search "${aliasTitle}" returned ${(aliasData?.animes || []).length} candidates`);
@@ -2392,7 +2424,9 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
   // 豆瓣未收录或未返回平台关联时，默认源可能只给出 360 的解说/专访条目。
   // 单集媒体端点补查未配置的直连视频源，并合并所有候选，让 Infuse 可以手动选源。
   // sourceOrderOverride 不会改写全局配置；电视剧先走默认源，只有没有目标集数时才补查直连源。
-  const fallbackSourceOrder = resolveMissingDirectFallbackSources();
+  const fallbackSourceOrder = sourceOrderOverride
+    ? []
+    : resolveMissingDirectFallbackSources();
   const needsFeatureFallback = featureRequest
     && fallbackSourceOrder.length > 0;
   let fallbackAttempted = false;
@@ -2468,19 +2502,10 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
           filteredEpisodes = selectRequestedEpisodes(bangumiData.bangumi.episodes, episode);
         }
 
-        // 只有当过滤后还有集数时才添加到结果中
+        // 先保留来源和原始分集，待所有候选收集完成后统一生成 Infuse ID，
+        // 这样跨源 hash 冲突的处理不依赖异步源的返回顺序。
         if (filteredEpisodes.length > 0) {
-          results.push(Episodes.fromJson({
-            animeId: animeItem.animeId,
-            animeTitle: animeItem.animeTitle,
-            type: animeItem.type,
-            typeDescription: animeItem.typeDescription,
-            episodes: filteredEpisodes.map(ep => ({
-              episodeId: ep.episodeId,
-              episodeTitle: ep.episodeTitle,
-              url: ep.url || ""
-            }))
-          }));
+          results.push({ animeItem, episodes: filteredEpisodes });
         }
       }
     }
@@ -2488,19 +2513,68 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
     return results;
   };
 
-  let resultAnimes = await collectEpisodeResults(searchData);
+  let resultRecords = await collectEpisodeResults(searchData);
 
   // 默认源可能返回了剧名，但没有请求集数（常见于新剧、跨平台集数不同、
   // 或 TMDB 中文名与源站标题略有差异）。只有此时再补查直连源，避免每次播放都放大请求量。
-  if (!featureRequest && /^\d+$/.test(episode) && resultAnimes.length === 0) {
+  if (!featureRequest && /^\d+$/.test(episode) && resultRecords.length === 0) {
     await searchTitleAliases();
     if (searchData?.animes?.length > 0) {
-      resultAnimes = await collectEpisodeResults(searchData);
+      resultRecords = await collectEpisodeResults(searchData);
     }
     await searchDirectFallback();
     if (searchData?.animes?.length > 0) {
-      resultAnimes = await collectEpisodeResults(searchData);
+      resultRecords = await collectEpisodeResults(searchData);
     }
+  }
+
+  const flattenedCandidates = resultRecords.flatMap(record =>
+    record.episodes.map(ep => ({
+      source: record.animeItem.source,
+      url: ep.url || '',
+      title: ep.episodeTitle || '',
+    }))
+  );
+  const requestedEpisode = /^\d+$/.test(episode)
+    ? Number(episode)
+    : (featureRequest ? 1 : 0);
+  const stableIds = tmdbId
+    ? assignInfuseEpisodeIds(flattenedCandidates, {
+        tmdbId,
+        mediaType,
+        episode: requestedEpisode,
+      })
+    : null;
+  let flatIndex = 0;
+  const mappingWrites = [];
+  const resultAnimes = resultRecords.map(({ animeItem, episodes }) => Episodes.fromJson({
+    animeId: animeItem.animeId,
+    animeTitle: animeItem.animeTitle,
+    type: animeItem.type,
+    typeDescription: animeItem.typeDescription,
+    episodes: episodes.map(ep => {
+      const candidateIndex = flatIndex++;
+      const episodeId = stableIds?.[candidateIndex] ?? ep.episodeId;
+      if (stableIds?.[candidateIndex] !== undefined && ep.url) {
+        mappingWrites.push(rememberInfuseEpisodeMapping({
+          id: episodeId,
+          url: ep.url,
+          title: ep.episodeTitle,
+          animeTitle: animeItem.animeTitle,
+          source: animeItem.source,
+        }));
+      }
+      return {
+        episodeId,
+        episodeTitle: ep.episodeTitle,
+        url: ep.url || "",
+      };
+    }),
+  }));
+  await Promise.allSettled(mappingWrites);
+
+  if (tmdbId && flattenedCandidates.length > 0 && !stableIds) {
+    log('warn', `[system] [episodes] Unable to encode stable Infuse IDs for tmdbId=${tmdbId}, episode=${requestedEpisode}`);
   }
 
   log("info", `[system] [episodes] Found ${resultAnimes.length} animes with filtered episodes`);
@@ -2511,6 +2585,50 @@ export async function searchEpisodes(url, searchAnimeFn = searchAnime, tmdbTitle
     errorMessage: "",
     animes: resultAnimes
   });
+}
+
+// Cloudflare may serve discovery and comment requests from different isolates.
+// On a mapping miss, decode the deterministic ID and repeat only the encoded
+// source lookup. This is slower than the memory/Cache API fast path, but keeps
+// Infuse functional without requiring a user-managed KV or Redis service.
+export async function recoverInfuseEpisodeMapping(commentId, searchEpisodesFn = searchEpisodes) {
+  const existing = await getInfuseEpisodeMapping(commentId);
+  if (existing) return existing;
+
+  const context = decodeInfuseEpisodeId(commentId);
+  if (!context) return null;
+
+  const recoveryUrl = new URL('http://infuse-recovery.local/api/v2/search/episodes');
+  recoveryUrl.searchParams.set('v2', 'true');
+  recoveryUrl.searchParams.set('tmdbId', String(context.tmdbId));
+  recoveryUrl.searchParams.set('tmdbIdType', context.mediaType === 'movie' ? '1' : '0');
+  recoveryUrl.searchParams.set('episode', String(context.episode || 1));
+
+  try {
+    const response = await searchEpisodesFn(
+      recoveryUrl,
+      searchAnime,
+      getTmdbMediaTitleById,
+      context.source ? { sourceOrderOverride: [context.source], recovery: true } : { recovery: true },
+    );
+    if (!response?.ok) return null;
+    const data = await response.json();
+    for (const anime of data?.animes || []) {
+      for (const episodeItem of anime?.episodes || []) {
+        if (Number(episodeItem?.episodeId) !== Number(commentId) || !episodeItem?.url) continue;
+        return await rememberInfuseEpisodeMapping({
+          id: commentId,
+          url: episodeItem.url,
+          title: episodeItem.episodeTitle,
+          animeTitle: anime.animeTitle,
+          source: context.source,
+        });
+      }
+    }
+  } catch (error) {
+    log('warn', `[system] [episodes] Infuse mapping recovery failed for ${commentId}: ${error.message}`);
+  }
+  return null;
 }
 
 // Extracted function for GET /api/v2/bangumi/:animeId
@@ -2822,10 +2940,14 @@ async function fetchMergedComments(url, animeTitle, commentId) {
 // Extracted function for GET /api/v2/comment/:commentId
 export async function getComment(path, queryFormat, segmentFlag, clientIp, includeDuration = false) {
   const commentId = parseInt(path.split("/").pop());
-  let animeTitle = findAnimeTitleById(commentId);
-  let url = findUrlById(commentId);
-  let title = findTitleById(commentId);
-  let plat = title ? extractEpisodeTitle(title) : null;
+  let infuseMapping = await getInfuseEpisodeMapping(commentId);
+  if (!infuseMapping && decodeInfuseEpisodeId(commentId)) {
+    infuseMapping = await recoverInfuseEpisodeMapping(commentId);
+  }
+  let animeTitle = infuseMapping?.animeTitle || findAnimeTitleById(commentId);
+  let url = infuseMapping?.url || findUrlById(commentId);
+  let title = infuseMapping?.title || findTitleById(commentId);
+  let plat = (title ? extractEpisodeTitle(title) : null) || infuseMapping?.source || null;
   if (url?.startsWith('local:')) {
     return getCommentByUrl(url, queryFormat, segmentFlag, includeDuration);
   }

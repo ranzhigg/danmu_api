@@ -6,9 +6,15 @@ dotenv.config();
 
 import test from 'node:test';
 import assert from 'node:assert';
-import { extractTitleSeasonEpisode, buildSearchAnimeUrl, searchEpisodes, matchSeason, matchAniAndEp, fallbackMatchAniAndEp } from '../../apis/dandan-api.js';
+import { extractTitleSeasonEpisode, buildSearchAnimeUrl, searchEpisodes, recoverInfuseEpisodeMapping, matchSeason, matchAniAndEp, fallbackMatchAniAndEp } from '../../apis/dandan-api.js';
 import { Globals } from '../../configs/globals.js';
 import { normalizeTitleForMatch } from '../../utils/common-util.js';
+import {
+  assignInfuseEpisodeIds,
+  clearInfuseEpisodeMappingsForTest,
+  decodeInfuseEpisodeId,
+  getInfuseEpisodeMapping,
+} from '../../utils/infuse-util.js';
 import { urlPrefix } from '../helpers/context.js';
 
 test('buildSearchAnimeUrl should preserve special characters in keyword', async () => {
@@ -31,6 +37,7 @@ test('buildSearchAnimeUrl should derive /search/anime from /search/episodes requ
 
 test('searchEpisodes should accept Infuse-style tmdbId-only requests', async () => {
   Globals.init({ LOG_LEVEL: 'error' });
+  clearInfuseEpisodeMappingsForTest();
 
   const requestUrl = new URL(`${urlPrefix}/api/v2/search/episodes?tmdbId=300146&tmdbIdType=0&episode=1`);
   const fakeSearchAnime = async (searchUrl, _preferAnimeId, _preferSource, detailStore) => {
@@ -81,7 +88,55 @@ test('searchEpisodes should accept Infuse-style tmdbId-only requests', async () 
   assert.equal(body.animes.length, 1);
   assert.equal(body.animes[0].animeId, 7001);
   assert.equal(body.animes[0].episodes.length, 1);
-  assert.equal(body.animes[0].episodes[0].episodeId, 700101);
+  const stableId = body.animes[0].episodes[0].episodeId;
+  assert.deepEqual(decodeInfuseEpisodeId(stableId), {
+    id: stableId,
+    tmdbId: 300146,
+    mediaType: 'tv',
+    episode: 1,
+    source: 'dandan',
+    hash: decodeInfuseEpisodeId(stableId).hash,
+  });
+  assert.deepEqual(await getInfuseEpisodeMapping(stableId), {
+    id: stableId,
+    url: 'https://example.com/episode-1',
+    title: '第1集',
+    animeTitle: '嫁金钗(2026)【电视剧】',
+    source: 'dandan',
+  });
+});
+
+test('recoverInfuseEpisodeMapping rebuilds a cold mapping from its encoded source context', async () => {
+  const [stableId] = assignInfuseEpisodeIds([
+    { source: 'youku', title: '【youku】 第5集', url: 'https://v.youku.com/v_show/id_test.html' },
+  ], { tmdbId: 300146, mediaType: 'tv', episode: 5 });
+  clearInfuseEpisodeMappingsForTest();
+
+  const mapping = await recoverInfuseEpisodeMapping(stableId, async (url, _search, _resolver, options) => {
+    assert.equal(url.searchParams.get('tmdbId'), '300146');
+    assert.equal(url.searchParams.get('tmdbIdType'), '0');
+    assert.equal(url.searchParams.get('episode'), '5');
+    assert.deepEqual(options.sourceOrderOverride, ['youku']);
+    return new Response(JSON.stringify({
+      success: true,
+      animes: [{
+        animeTitle: '嫁金钗(2026)【电视剧】',
+        episodes: [{
+          episodeId: stableId,
+          episodeTitle: '【youku】 第5集',
+          url: 'https://v.youku.com/v_show/id_test.html',
+        }],
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+
+  assert.deepEqual(mapping, {
+    id: stableId,
+    url: 'https://v.youku.com/v_show/id_test.html',
+    title: '【youku】 第5集',
+    animeTitle: '嫁金钗(2026)【电视剧】',
+    source: 'youku',
+  });
 });
 
 test('searchEpisodes should treat TMDB movie requests as single-item media across source categories', async () => {
@@ -204,8 +259,10 @@ test('searchEpisodes should use direct sources when the configured movie sources
     assert.ok(calls[1].includes('youku'));
     assert.deepEqual(body.animes.map(anime => anime.animeId), [8202, 8203]);
     assert.deepEqual(body.animes.map(anime => anime.animeTitle), [feature.animeTitle, featureFromYouku.animeTitle]);
-    assert.equal(body.animes[0].episodes[0].episodeId, 820201);
-    assert.equal(body.animes[1].episodes[0].episodeId, 820301);
+    assert.equal(body.animes[0].episodes[0].url, 'https://example.com/feature');
+    assert.equal(body.animes[1].episodes[0].url, 'https://example.com/feature-youku');
+    assert.equal(decodeInfuseEpisodeId(body.animes[0].episodes[0].episodeId).source, 'tencent');
+    assert.equal(decodeInfuseEpisodeId(body.animes[1].episodes[0].episodeId).source, 'youku');
   } finally {
     if (previousCaches === undefined) delete globalThis.caches;
     else globalThis.caches = previousCaches;
@@ -370,7 +427,8 @@ test('searchEpisodes should retry the TMDB original title when the localized TV 
     const body = await response.json();
 
     assert.equal(body.animes.length, 1);
-    assert.equal(body.animes[0].episodes[0].episodeId, 850101);
+    assert.equal(body.animes[0].episodes[0].url, 'https://example.com/original-1');
+    assert.equal(decodeInfuseEpisodeId(body.animes[0].episodes[0].episodeId).source, 'youku');
     assert.deepEqual(calls.slice(0, 2).map(call => call.keyword), ['本地译名', 'Original Series']);
   } finally {
     if (previousCaches === undefined) delete globalThis.caches;
