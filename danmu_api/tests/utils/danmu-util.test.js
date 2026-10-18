@@ -55,6 +55,28 @@ test('danmu text conversion should run after normalization and before filtering 
 
     resetSearchState();
   });
+
+test('Infuse-compatible normalization drops blank text and invalid playback positions for every source', () => {
+  Globals.init({
+    BLOCKED_WORDS: '',
+    GROUP_MINUTE: '0',
+    DANMU_LIMIT: '0',
+    CONVERT_COLOR: 'default'
+  });
+
+  const output = convertToDanmakuJson([
+    { timepoint: 1, ct: 1, color: 16777215, content: ' 腾讯正文 ' },
+    { p: '2,1,16777215,[iqiyi]', m: '爱奇艺正文' },
+    { p: '3,1,16777215,[mango]', m: '' },
+    { p: '4,1,16777215,[bilibili]', m: '   ' },
+    { p: 'not-a-time,1,16777215,[migu]', m: '无效时间' },
+    { timepoint: -1, ct: 1, color: 16777215, content: '负时间' },
+  ], 'mixed');
+
+  assert.deepEqual(output.map(item => item.m), ['腾讯正文', '爱奇艺正文']);
+  assert.ok(output.every(item => Number.isFinite(Number(item.p.split(',')[0]))));
+  resetSearchState();
+});
 test('BLOCKED_WORDS 屏蔽词解析与过滤', async () => {
     const baseEnv = {
       GROUP_MINUTE: '0',

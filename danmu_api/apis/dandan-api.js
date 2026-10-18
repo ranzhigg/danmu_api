@@ -23,6 +23,7 @@ import {
   decodeInfuseEpisodeId,
   getInfuseEpisodeMapping,
   rememberInfuseEpisodeMapping,
+  resolveInfuseCandidateSource,
 } from "../utils/infuse-util.js";
 import { applyMergeLogic, mergeDanmakuList, MERGE_DELIMITER, alignSourceTimelines, sanitizeUrl } from "../utils/merge-util.js";
 import { getHanjutvSourceLabel } from "../utils/hanjutv-util.js";
@@ -2209,6 +2210,9 @@ const DIRECT_FALLBACK_SOURCE_ORDER = Object.freeze([
   'maiduidui',
   'aiyifan',
   'hongguo',
+  'renren',
+  'hanjutv',
+  'vod',
   'other',
   'dandan',
   'bahamut',
@@ -2530,7 +2534,11 @@ export async function searchEpisodes(
 
   const flattenedCandidates = resultRecords.flatMap(record =>
     record.episodes.map(ep => ({
-      source: record.animeItem.source,
+      source: resolveInfuseCandidateSource({
+        source: record.animeItem.source,
+        title: ep.episodeTitle,
+        url: ep.url,
+      }),
       url: ep.url || '',
       title: ep.episodeTitle || '',
     }))
@@ -2613,17 +2621,35 @@ export async function recoverInfuseEpisodeMapping(commentId, searchEpisodesFn = 
     );
     if (!response?.ok) return null;
     const data = await response.json();
+    const candidates = [];
     for (const anime of data?.animes || []) {
       for (const episodeItem of anime?.episodes || []) {
-        if (Number(episodeItem?.episodeId) !== Number(commentId) || !episodeItem?.url) continue;
-        return await rememberInfuseEpisodeMapping({
-          id: commentId,
-          url: episodeItem.url,
-          title: episodeItem.episodeTitle,
-          animeTitle: anime.animeTitle,
-          source: context.source,
-        });
+        if (!episodeItem?.url) continue;
+        const candidate = { anime, episodeItem };
+        if (Number(episodeItem.episodeId) === Number(commentId)) {
+          candidates.unshift(candidate);
+        } else if (decodeInfuseEpisodeId(episodeItem.episodeId)?.source === context.source) {
+          candidates.push(candidate);
+        }
       }
+    }
+
+    // Exact deterministic ID is preferred. If a provider refreshed a signed or
+    // proxy URL, its fingerprint can change between discovery and comment. A
+    // source-scoped lookup that yields exactly one requested episode is still
+    // unambiguous, so rebind the original public ID to the fresh URL.
+    const exact = candidates.find(({ episodeItem }) =>
+      Number(episodeItem.episodeId) === Number(commentId)
+    );
+    const selected = exact || (candidates.length === 1 ? candidates[0] : null);
+    if (selected) {
+      return await rememberInfuseEpisodeMapping({
+        id: commentId,
+        url: selected.episodeItem.url,
+        title: selected.episodeItem.episodeTitle,
+        animeTitle: selected.anime.animeTitle,
+        source: context.source,
+      });
     }
   } catch (error) {
     log('warn', `[system] [episodes] Infuse mapping recovery failed for ${commentId}: ${error.message}`);
@@ -2824,7 +2850,7 @@ async function fetchMergedComments(url, animeTitle, commentId) {
             }
             // 获取原始数据 -> 格式化
             const raw = await sourceInstance.getEpisodeDanmu(resolvedId, parts);
-            let formatted = sourceInstance.formatComments(raw);
+            let formatted = sourceInstance.formatCommentsSafely(raw);
             log("info", `[${sourceLabel}] 获取弹幕 ${formatted.length} 条`);
             
             // 应用手动偏移值
@@ -2947,7 +2973,12 @@ export async function getComment(path, queryFormat, segmentFlag, clientIp, inclu
   let animeTitle = infuseMapping?.animeTitle || findAnimeTitleById(commentId);
   let url = infuseMapping?.url || findUrlById(commentId);
   let title = infuseMapping?.title || findTitleById(commentId);
-  let plat = (title ? extractEpisodeTitle(title) : null) || infuseMapping?.source || null;
+  const sourceLabel = (title ? extractEpisodeTitle(title) : null) || infuseMapping?.source || null;
+  let plat = resolveInfuseCandidateSource({
+    source: infuseMapping?.source,
+    title,
+    url,
+  }) || null;
   if (url?.startsWith('local:')) {
     return getCommentByUrl(url, queryFormat, segmentFlag, includeDuration);
   }
@@ -3013,59 +3044,37 @@ export async function getComment(path, queryFormat, segmentFlag, clientIp, inclu
   } else {
     const commentUrl = cleanUrl;
     const isHongguoUrl = isHongguoPlayerUrl(commentUrl);
+    const sourceKey = isHongguoUrl ? 'hongguo' : plat;
+    const commentCapableSources = new Set([
+      'renren', 'hanjutv', 'bahamut', 'dandan', 'custom', 'tencent',
+      'iqiyi', 'imgo', 'bilibili', 'migu', 'youku', 'sohu', 'leshi',
+      'xigua', 'maiduidui', 'aiyifan', 'hongguo', 'animeko', 'other',
+    ]);
 
-    if (url.includes('.qq.com')) {
-      danmus = await sourceLogContext.run('tencent', () => tencentSource.getComments(commentUrl, plat, segmentFlag));
-    } else if (url.includes('.iqiyi.com')) {
-      danmus = await sourceLogContext.run('iqiyi', () => iqiyiSource.getComments(commentUrl, plat, segmentFlag));
-    } else if (url.includes('.mgtv.com')) {
-      danmus = await sourceLogContext.run('mango', () => mangoSource.getComments(commentUrl, plat, segmentFlag));
-    } else if (url.includes('.bilibili.com') || url.includes('b23.tv')) {
-      // 如果是 b23.tv 短链接，先解析为完整 URL
-      let resolvedUrl = commentUrl;
-      if (resolvedUrl.includes('b23.tv')) {
-        resolvedUrl = await sourceLogContext.run('bilibili', () => bilibiliSource.resolveB23Link(resolvedUrl));
+    if (sourceKey && commentCapableSources.has(sourceKey)) {
+      let sourceUrl = sourceKey === 'hongguo' ? commentUrl : sanitizeUrl(commentUrl);
+      if (sourceKey === 'bilibili' && sourceUrl.includes('b23.tv')) {
+        sourceUrl = await sourceLogContext.run('bilibili', () => bilibiliSource.resolveB23Link(sourceUrl));
+      } else if (sourceKey === 'animeko') {
+        const bgmMatch = sourceUrl.match(/(?:bgm\.tv|bangumi\.tv|bangumi\.lol|chii\.in)\/ep\/(\d+)/);
+        sourceUrl = bgmMatch ? bgmMatch[1] : sourceUrl;
+      } else if (sourceKey === 'bahamut') {
+        const bahaMatch = sourceUrl.match(/sn=(\d+)/);
+        sourceUrl = bahaMatch ? bahaMatch[1] : sourceUrl;
       }
-      danmus = await sourceLogContext.run('bilibili', () => bilibiliSource.getComments(resolvedUrl, plat, segmentFlag));
-    } else if (url.includes('.youku.com')) {
-      danmus = await sourceLogContext.run('youku', () => youkuSource.getComments(commentUrl, plat, segmentFlag));
-    } else if (url.includes('.miguvideo.com')) {
-      danmus = await sourceLogContext.run('migu', () => miguSource.getComments(commentUrl, plat, segmentFlag));
-    } else if (url.includes('.sohu.com')) {
-      danmus = await sourceLogContext.run('sohu', () => sohuSource.getComments(commentUrl, plat, segmentFlag));
-    } else if (url.includes('.le.com')) {
-      danmus = await sourceLogContext.run('leshi', () => leshiSource.getComments(commentUrl, plat, segmentFlag));
-    } else if (url.includes('.douyin.com') || url.includes('.ixigua.com')) {
-      danmus = await sourceLogContext.run('xigua', () => xiguaSource.getComments(commentUrl, plat, segmentFlag));
-    } else if (url.includes('.mddcloud.com.cn')) {
-      danmus = await sourceLogContext.run('maiduidui', () => maiduiduiSource.getComments(commentUrl, plat, segmentFlag));
-    } else if (url.includes('.yfsp.tv')) {
-      danmus = await sourceLogContext.run('aiyifan', () => aiyifanSource.getComments(commentUrl, plat, segmentFlag));
-    } else if (isHongguoUrl) {
-      danmus = await sourceLogContext.run('hongguo', () => hongguoSource.getComments(commentUrl, 'hongguo', segmentFlag));
-    } else if (/(?:bgm|bangumi)\.(?:tv|lol)\/ep\/|chii\.in\/ep\//.test(url)) {
-      const bgmMatch = commentUrl.match(/(?:bgm\.tv|bangumi\.tv|bangumi\.lol|chii\.in)\/ep\/(\d+)/);
-      danmus = await sourceLogContext.run('animeko', () => animekoSource.getComments(bgmMatch ? bgmMatch[1] : commentUrl, plat, segmentFlag));
-    } else if (url.includes('ani.gamer.com.tw')) {
-      const bahaMatch = commentUrl.match(/sn=(\d+)/);
-      danmus = await sourceLogContext.run('bahamut', () => bahamutSource.getComments(bahaMatch ? bahaMatch[1] : commentUrl, plat, segmentFlag));
-    }
 
-    // 请求其他平台弹幕
-    const urlPattern = /^(https?:\/\/)?([\w.-]+)\.([a-z]{2,})(\/.*)?$/i;
-    if (!urlPattern.test(url) && !isHongguoUrl) {
-      // 剥离单源 source:id 前缀（如 bahamut:50709 → 50709），使各源拿到真实 ID，与合并路径分割逻辑一致
-      const sourceUrl = sanitizeUrl(commentUrl);
-      // plat 值即源调度键名，直接从注册表查实例；未注册则跳过
-      const platSource = getSourceByKey(plat);
-      if (platSource) {
-        danmus = await sourceLogContext.run(plat, () => platSource.getComments(sourceUrl, plat, segmentFlag));
+      const sourceInstance = getSourceByKey(sourceKey);
+      if (sourceInstance) {
+        danmus = await sourceLogContext.run(
+          getLogNameByKey(sourceKey),
+          () => sourceInstance.getComments(sourceUrl, sourceLabel || sourceKey, segmentFlag),
+        );
       }
     }
 
-    // 如果弹幕为空，则请求第三方弹幕服务器作为兜底
-    if ((!danmus || danmus.length === 0) && urlPattern.test(url)) {
-      danmus = await sourceLogContext.run('other', () => otherSource.getComments(url, "other_server", segmentFlag));
+    // HTTP(S) 链接无法由明确来源解析或原源返回空时，保留第三方服务器兜底。
+    if ((!danmus || danmus.length === 0) && /^https?:\/\//i.test(commentUrl) && sourceKey !== 'other') {
+      danmus = await sourceLogContext.run('other', () => otherSource.getComments(commentUrl, "other_server", segmentFlag));
     }
   }
 

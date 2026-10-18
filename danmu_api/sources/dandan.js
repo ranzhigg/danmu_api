@@ -910,7 +910,7 @@ async function getRelatedDanmuViaNipaplay(links, coveredSources) {
       pending.push({
         platformLabel,
         run: () => sourceInstance.getEpisodeDanmu(realId)
-          .then((raw) => sourceInstance.formatComments(raw || []).map((d) => applyShiftToDanmu({ ...d, realTimeSource: platformLabel }, shift)))
+          .then((raw) => sourceInstance.formatCommentsSafely(raw || []).map((d) => applyShiftToDanmu({ ...d, realTimeSource: platformLabel }, shift)))
           .catch((e) => { log("error", `[dandan] 弹弹302关联拉取 ${platformLabel} 失败: ${e.message}`); return []; }),
       });
     }

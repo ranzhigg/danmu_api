@@ -68,18 +68,55 @@ const SOURCE_ALIASES = Object.freeze({
   qiyi: 'iqiyi',
   mango: 'imgo',
   '360kan': '360',
+  bilibili1: 'bilibili',
+  other_server: 'other',
 });
 
 const memoryMappings = new Map();
 
-function normalizeSourceKey(source) {
+export function normalizeInfuseSourceKey(source) {
   const value = String(source || '').trim().toLowerCase();
   return SOURCE_ALIASES[value] || value;
 }
 
 function sourceIndexFor(source) {
-  const index = INFUSE_SOURCE_KEYS.indexOf(normalizeSourceKey(source));
+  const index = INFUSE_SOURCE_KEYS.indexOf(normalizeInfuseSourceKey(source));
   return index >= 0 ? index : 0;
+}
+
+function sourceFromUrl(value) {
+  const url = String(value || '').toLowerCase();
+  if (!url) return '';
+  if (url.includes('.qq.com')) return 'tencent';
+  if (url.includes('.iqiyi.com')) return 'iqiyi';
+  if (url.includes('.mgtv.com')) return 'imgo';
+  if (url.includes('.bilibili.com') || url.includes('b23.tv')) return 'bilibili';
+  if (url.includes('.youku.com')) return 'youku';
+  if (url.includes('.miguvideo.com')) return 'migu';
+  if (url.includes('.sohu.com')) return 'sohu';
+  if (url.includes('.le.com') || url.includes('.letv.com')) return 'leshi';
+  if (url.includes('.douyin.com') || url.includes('.ixigua.com')) return 'xigua';
+  if (url.includes('.mddcloud.com.cn')) return 'maiduidui';
+  if (url.includes('.yfsp.tv')) return 'aiyifan';
+  if (/(?:bgm|bangumi)\.(?:tv|lol)\/ep\/|chii\.in\/ep\//.test(url)) return 'animeko';
+  if (url.includes('ani.gamer.com.tw')) return 'bahamut';
+  if (url.startsWith('hongguo:v1:')) return 'hongguo';
+  if (url.startsWith('local:')) return 'local';
+  return '';
+}
+
+function sourceFromTitle(value) {
+  const match = String(value || '').match(/【(.*?)】/);
+  return normalizeInfuseSourceKey(match?.[1]);
+}
+
+// VOD/metadata aggregators may report their own source while the playable link
+// belongs to a concrete provider. Prefer an identifiable URL, then the episode
+// label, and use the owning search source only as the final fallback.
+export function resolveInfuseCandidateSource(candidate = {}) {
+  return sourceFromUrl(candidate.url)
+    || sourceFromTitle(candidate.title)
+    || normalizeInfuseSourceKey(candidate.source);
 }
 
 function hashIdentity(value) {
@@ -148,7 +185,7 @@ export function assignInfuseEpisodeIds(candidates, rawContext) {
   if (!context || !Array.isArray(candidates)) return null;
 
   const indexed = candidates.map((candidate, index) => {
-    const source = normalizeSourceKey(candidate?.source);
+    const source = resolveInfuseCandidateSource(candidate);
     const resource = String(candidate?.url || '').trim() || String(candidate?.title || '').trim();
     const identity = [source, resource].join('|');
     return { candidate, index, source, identity };
@@ -188,7 +225,7 @@ function normalizeMapping(mapping) {
     url,
     title: String(mapping?.title || ''),
     animeTitle: String(mapping?.animeTitle || ''),
-    source: normalizeSourceKey(mapping?.source),
+    source: normalizeInfuseSourceKey(mapping?.source),
   };
 }
 

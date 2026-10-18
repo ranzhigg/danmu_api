@@ -139,6 +139,36 @@ test('recoverInfuseEpisodeMapping rebuilds a cold mapping from its encoded sourc
   });
 });
 
+test('recoverInfuseEpisodeMapping accepts one source-scoped episode when a signed URL changed', async () => {
+  const [stableId] = assignInfuseEpisodeIds([
+    { source: 'iqiyi', title: '【qiyi】 第3集', url: 'https://www.iqiyi.com/v_old.html?token=old' },
+  ], { tmdbId: 123456, mediaType: 'tv', episode: 3 });
+  const [refreshedId] = assignInfuseEpisodeIds([
+    { source: 'iqiyi', title: '【qiyi】 第3集', url: 'https://www.iqiyi.com/v_new.html?token=new' },
+  ], { tmdbId: 123456, mediaType: 'tv', episode: 3 });
+  assert.notEqual(refreshedId, stableId);
+  clearInfuseEpisodeMappingsForTest();
+
+  const mapping = await recoverInfuseEpisodeMapping(stableId, async (_url, _search, _resolver, options) => {
+    assert.deepEqual(options.sourceOrderOverride, ['iqiyi']);
+    return new Response(JSON.stringify({
+      success: true,
+      animes: [{
+        animeTitle: '测试剧(2026)【电视剧】from iqiyi',
+        episodes: [{
+          episodeId: refreshedId,
+          episodeTitle: '【qiyi】 第3集',
+          url: 'https://www.iqiyi.com/v_new.html?token=new',
+        }],
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+
+  assert.equal(mapping.id, stableId);
+  assert.equal(mapping.source, 'iqiyi');
+  assert.equal(mapping.url, 'https://www.iqiyi.com/v_new.html?token=new');
+});
+
 test('searchEpisodes should treat TMDB movie requests as single-item media across source categories', async () => {
   const previousCaches = globalThis.caches;
   const entries = new Map();

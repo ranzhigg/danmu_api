@@ -407,8 +407,17 @@ export function convertToDanmakuJson(contents, platform) {
       m = item.m;
     }
 
+    // Infuse requires a finite playback position and non-empty comment text.
+    // Enforce this once for every provider instead of allowing malformed rows
+    // from one adapter to poison the whole track or create invisible comments.
+    const numericTime = Number(time);
+    if (!Number.isFinite(numericTime) || numericTime < 0) continue;
+    if (m === undefined || m === null) continue;
+    m = String(m).trim();
+    if (!m) continue;
+
     // 优先使用弹幕自带的 _sourceLabel（应对合并工具），其次是外部传入的宏观 platform
-    let currentPlatform = item._sourceLabel || platform;
+    let currentPlatform = String(item._sourceLabel || platform || 'unknown');
 
     // 如果存在实时拉取的副源标签，安全追加
     if (item.realTimeSource && !currentPlatform.includes(item.realTimeSource)) {

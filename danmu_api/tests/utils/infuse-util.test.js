@@ -7,8 +7,38 @@ import {
   decodeInfuseEpisodeId,
   getInfuseEpisodeMapping,
   isInfuseEpisodeId,
+  normalizeInfuseSourceKey,
   rememberInfuseEpisodeMapping,
+  resolveInfuseCandidateSource,
 } from '../../utils/infuse-util.js';
+
+test('Infuse source routing normalizes aliases and concrete provider links', () => {
+  assert.equal(normalizeInfuseSourceKey('qq'), 'tencent');
+  assert.equal(normalizeInfuseSourceKey('qiyi'), 'iqiyi');
+  assert.equal(normalizeInfuseSourceKey('mango'), 'imgo');
+  assert.equal(normalizeInfuseSourceKey('bilibili1'), 'bilibili');
+
+  assert.equal(resolveInfuseCandidateSource({
+    source: 'vod',
+    title: '【qq】 第1集',
+    url: 'https://v.qq.com/x/cover/a/b.html',
+  }), 'tencent');
+  assert.equal(resolveInfuseCandidateSource({
+    source: 'vod',
+    title: '【bilibili1】 第1话',
+    url: 'opaque-episode-id',
+  }), 'bilibili');
+  assert.equal(resolveInfuseCandidateSource({
+    source: 'aiyifan',
+    title: '第1集',
+    url: 'https://custom-proxy.example/play/1',
+  }), 'aiyifan');
+  assert.equal(resolveInfuseCandidateSource({
+    source: 'renren',
+    title: '【renren】 第1集',
+    url: 'series-episode',
+  }), 'renren');
+});
 
 test('Infuse episode IDs are safe, reversible and independent of candidate order', () => {
   const candidates = [
@@ -67,4 +97,3 @@ test('Infuse episode mappings survive an isolate-local memory reset through Cach
     else globalThis.caches = previousCaches;
   }
 });
-

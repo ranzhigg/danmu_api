@@ -47,6 +47,34 @@ export default class BaseSource {
     throw new Error("Method 'formatComments' must be implemented");
   }
 
+  // Provider payloads occasionally contain one malformed row. Formatting the
+  // whole array in one map() used to make that single row reject the complete
+  // Infuse track. Retry row-by-row on formatter failure and keep valid rows.
+  formatCommentsSafely(comments) {
+    try {
+      const formatted = this.formatComments(comments);
+      return formatted ?? [];
+    } catch (error) {
+      log('warn', `[system] [base] 批量格式化失败，改为逐条跳过坏数据: ${error.message}`);
+    }
+
+    if (!Array.isArray(comments)) return [];
+    const formatted = [];
+    for (const item of comments) {
+      try {
+        const single = [item];
+        for (const key of Object.keys(comments)) {
+          if (!/^\d+$/.test(key)) single[key] = comments[key];
+        }
+        const rows = this.formatComments(single);
+        if (Array.isArray(rows)) formatted.push(...rows.filter(Boolean));
+      } catch (error) {
+        log('warn', `[system] [base] 已跳过无法格式化的弹幕: ${error.message}`);
+      }
+    }
+    return formatted;
+  }
+
   // 获取弹幕流水线方法(获取某集弹幕 -> 格式化弹幕 -> 弹幕处理，如去重/屏蔽字等)
   async getComments(id, sourceName, segmentFlag=false, progressCallback=null) {
     if (segmentFlag) {
@@ -59,7 +87,7 @@ export default class BaseSource {
     const raw = await this.getEpisodeDanmu(id);
     if(progressCallback) await progressCallback(85,`原始弹幕 ${raw.length} 条，正在规范化`);
     log("info", `[system] [base] 原始弹幕 ${raw.length} 条，正在规范化`);
-    const formatted = this.formatComments(raw);
+    const formatted = this.formatCommentsSafely(raw);
     if(progressCallback) await progressCallback(100,`弹幕处理完成，共 ${formatted.length} 条`);
     log("info", `[system] [base] 弹幕处理完成，共 ${formatted.length} 条`);
     return convertToDanmakuJson(formatted, sourceName);
@@ -72,7 +100,7 @@ export default class BaseSource {
     const raw = await this.getEpisodeSegmentDanmu(segment);
     if(progressCallback) await progressCallback(85,`原始分片弹幕 ${raw.length} 条，正在规范化`);
     log("info", `[system] [base] 原始分片弹幕 ${raw.length} 条，正在规范化`);
-    const formatted = this.formatComments(raw);
+    const formatted = this.formatCommentsSafely(raw);
     if(progressCallback) await progressCallback(100,`分片弹幕处理完成，共 ${formatted.length} 条`);
     log("info", `[system] [base] 分片弹幕处理完成，共 ${formatted.length} 条`);
     return convertToDanmakuJson(formatted, segment.type);
